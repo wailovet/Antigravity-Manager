@@ -17,6 +17,9 @@ pub struct ClaudeRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "stopSequences")]
+    pub stop_sequences: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
@@ -34,6 +37,7 @@ pub struct ThinkingConfig {
     #[serde(rename = "type")]
     pub type_: String, // "enabled"
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "budgetTokens")]
     pub budget_tokens: Option<u32>,
 }
 

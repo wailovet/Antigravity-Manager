@@ -54,6 +54,21 @@ Provider implementation: [`src-tauri/src/proxy/providers/zai_anthropic.rs`](../.
 - Injects z.ai auth (`Authorization` / `x-api-key`) and forwards the request body as-is.
 - Uses the global upstream proxy config when configured.
 
+## OpenCode compatibility notes
+OpenCode uses `@ai-sdk/anthropic` and sends top-level fields as Anthropic Messages API payloads.
+To keep compatibility across z.ai and non-z.ai routes, the proxy applies the following rules:
+
+### z.ai passthrough (`/v1/messages` routed to z.ai)
+- Accepts both `messages[].content` string and array formats (Anthropic standard).
+- Normalizes `thinking.budgetTokens` to `thinking.budget_tokens` for upstream compatibility.
+- Drops `temperature`, `top_p`, and `effort` (z.ai rejects these with `1210`).
+- Preserves unknown top-level fields (e.g. `tool_choice`, `stop_sequences`, `metadata`) while replacing only sanitized `messages`.
+- Normalizes streaming errors: z.ai may emit `event: error` without a `type` discriminator. The proxy rewrites these to Anthropic-compatible `{ "type": "error", ... }` and converts `[DONE]` to a `message_stop` event so SDK validators do not fail.
+
+### Google-backed Claude route (when z.ai is not selected)
+- `max_tokens` is mapped to `generationConfig.maxOutputTokens`.
+- `stop_sequences` is mapped to `generationConfig.stopSequences` (defaults apply when omitted).
+
 ## Validation
 1) Enable z.ai in the UI (`src/pages/ApiProxy.tsx`) and set `dispatch_mode=exclusive`.
    - UI: [`src/pages/ApiProxy.tsx`](../../src/pages/ApiProxy.tsx)

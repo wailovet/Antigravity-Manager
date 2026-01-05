@@ -57,6 +57,20 @@ Schema：`src-tauri/src/proxy/config.rs`
 - 注入 z.ai 鉴权（`Authorization` / `x-api-key`）。
 - 支持出站代理（`proxy.upstream_proxy`）。
 
+## OpenCode 兼容性说明
+OpenCode 使用 `@ai-sdk/anthropic` 发送 Anthropic Messages API 结构的顶层字段。为保证 z.ai 与非 z.ai 路由兼容，代理做了以下处理：
+
+### z.ai 直通（`/v1/messages` 路由到 z.ai）
+- `messages[].content` 支持字符串与数组两种格式（Anthropic 标准）。
+- 将 `thinking.budgetTokens` 规范化为 `thinking.budget_tokens`。
+- 移除 `temperature`、`top_p`、`effort`（z.ai 会返回 `1210`）。
+- 保留未知顶层字段（如 `tool_choice`、`stop_sequences`、`metadata`），只替换清理后的 `messages`。
+- 流式错误规范化：z.ai 的 `event: error` 可能不带 `type`，代理会改写为 Anthropic 兼容的 `{ "type": "error", ... }`，并把 `[DONE]` 转为 `message_stop`，避免 SDK 校验失败。
+
+### Google Claude 路由（未选 z.ai 时）
+- `max_tokens` 映射到 `generationConfig.maxOutputTokens`。
+- `stop_sequences` 映射到 `generationConfig.stopSequences`（未提供时使用默认值）。
+
 ## 验证
 1) 在 UI 中启用 z.ai 并设置 `dispatch_mode=exclusive`（`src/pages/ApiProxy.tsx`）。
 2) 启动代理。

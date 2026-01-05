@@ -10,6 +10,24 @@ use tokio::time::Duration;
 
 use crate::proxy::server::AppState;
 
+fn sanitize_body_for_zai(mut body: Value) -> Value {
+    // z.ai's Anthropic-compatible endpoint is stricter than Anthropic itself:
+    // it rejects some optional sampling parameters (observed: `temperature`, `top_p`).
+    // To keep client compatibility (e.g. Vercel AI SDK / OpenCode), drop them when present.
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("temperature");
+        obj.remove("top_p");
+        // `effort` is a client hint not supported by all upstreams.
+        obj.remove("effort");
+        if let Some(thinking) = obj.get_mut("thinking").and_then(|v| v.as_object_mut()) {
+            if let Some(budget) = thinking.remove("budgetTokens") {
+                thinking.entry("budget_tokens".to_string()).or_insert(budget);
+            }
+        }
+    }
+    body
+}
+
 fn map_model_for_zai(original: &str, state: &crate::proxy::ZaiConfig) -> String {
     let m = original.to_lowercase();
     if let Some(mapped) = state.model_mapping.get(original) {
@@ -71,7 +89,7 @@ fn copy_passthrough_headers(incoming: &HeaderMap) -> HeaderMap {
     for (k, v) in incoming.iter() {
         let key = k.as_str().to_ascii_lowercase();
         match key.as_str() {
-            "content-type" | "accept" | "anthropic-version" | "user-agent" => {
+            "content-type" | "accept" | "anthropic-version" | "anthropic-beta" | "user-agent" => {
                 out.insert(k.clone(), v.clone());
             }
             // Some clients use these for streaming; safe to pass through.
@@ -122,6 +140,8 @@ pub async fn forward_anthropic_json(
         return (StatusCode::BAD_REQUEST, "z.ai api_key is not set").into_response();
     }
 
+    body = sanitize_body_for_zai(body);
+
     if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
         let mapped = map_model_for_zai(model, &zai);
         body["model"] = Value::String(mapped);
@@ -167,13 +187,136 @@ pub async fn forward_anthropic_json(
         out = out.header(header::CONTENT_TYPE, ct.clone());
     }
 
-    // Stream response body to the client (covers SSE and non-SSE).
-    let stream = resp.bytes_stream().map(|chunk| match chunk {
-        Ok(b) => Ok::<Bytes, std::io::Error>(b),
-        Err(e) => Ok(Bytes::from(format!("Upstream stream error: {}", e))),
-    });
+    let is_sse = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/event-stream"))
+        .unwrap_or(false);
 
-    out.body(Body::from_stream(stream)).unwrap_or_else(|_| {
+    // Stream response body to the client (covers SSE and non-SSE).
+    // For SSE, normalize z.ai `event: error` payloads to Anthropic-compatible shape so clients
+    // that validate the `type` discriminator don't fail.
+    let stream = if is_sse {
+        use async_stream::stream;
+        use bytes::BytesMut;
+
+        let mut upstream = resp.bytes_stream();
+
+        Body::from_stream(stream! {
+            let mut buffer = BytesMut::new();
+            let mut current_event: Option<String> = None;
+
+            while let Some(chunk) = upstream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        buffer.extend_from_slice(&bytes);
+
+                        while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                            let line = buffer.split_to(pos + 1);
+                            let line_bytes = line.freeze();
+
+                            let Ok(line_str) = std::str::from_utf8(&line_bytes) else {
+                                yield Ok::<Bytes, std::io::Error>(line_bytes);
+                                continue;
+                            };
+
+                            let trimmed = line_str.trim_end_matches('\n');
+                            if trimmed.trim().is_empty() {
+                                current_event = None;
+                                yield Ok::<Bytes, std::io::Error>(line_bytes);
+                                continue;
+                            }
+
+                            if let Some(rest) = trimmed.strip_prefix("event:") {
+                                current_event = Some(rest.trim().to_string());
+                                yield Ok::<Bytes, std::io::Error>(line_bytes);
+                                continue;
+                            }
+
+                            if let Some(rest) = trimmed.strip_prefix("data:") {
+                                let data = rest.trim();
+
+                                // z.ai sometimes ends error streams with OpenAI-style [DONE].
+                                // Convert it to Anthropic-style termination.
+                                if data == "[DONE]" {
+                                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"event: message_stop\n"));
+                                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: {\"type\":\"message_stop\"}\n\n"));
+                                    current_event = None;
+                                    continue;
+                                }
+
+                                if current_event.as_deref() == Some("error") {
+                                    if let Ok(json) = serde_json::from_str::<Value>(data) {
+                                        // z.ai error payload is usually `{ error: {code, message}, request_id }`
+                                        // which is missing the Anthropic `type` discriminator.
+                                        if json.get("type").is_none() && json.get("error").is_some() {
+                                            let code = json
+                                                .get("error")
+                                                .and_then(|e| e.get("code"))
+                                                .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_u64().map(|n| n.to_string())))
+                                                .unwrap_or_else(|| "unknown".to_string());
+                                            let message = json
+                                                .get("error")
+                                                .and_then(|e| e.get("message"))
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("Upstream error")
+                                                .to_string();
+                                            let request_id = json.get("request_id").cloned();
+
+                                            let mut out_json = serde_json::json!({
+                                                "type": "error",
+                                                "error": {
+                                                    "type": "invalid_request_error",
+                                                    "message": message,
+                                                    "code": code
+                                                }
+                                            });
+                                            if let Some(request_id) = request_id {
+                                                out_json["request_id"] = request_id;
+                                            }
+
+                                            let encoded = match serde_json::to_string(&out_json) {
+                                                Ok(s) => s,
+                                                Err(_) => {
+                                                    yield Ok::<Bytes, std::io::Error>(line_bytes);
+                                                    continue;
+                                                }
+                                            };
+
+                                            let rewritten = Bytes::from(format!("data: {}\n", encoded));
+                                            yield Ok::<Bytes, std::io::Error>(rewritten);
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                yield Ok::<Bytes, std::io::Error>(line_bytes);
+                                continue;
+                            }
+
+                            yield Ok::<Bytes, std::io::Error>(line_bytes);
+                        }
+                    }
+                    Err(e) => {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("Upstream stream error: {}", e)));
+                        break;
+                    }
+                }
+            }
+
+            if !buffer.is_empty() {
+                yield Ok::<Bytes, std::io::Error>(buffer.freeze());
+            }
+        })
+    } else {
+        Body::from_stream(resp.bytes_stream().map(|chunk| match chunk {
+            Ok(b) => Ok::<Bytes, std::io::Error>(b),
+            Err(e) => Ok(Bytes::from(format!("Upstream stream error: {}", e))),
+        }))
+    };
+
+    out.body(stream).unwrap_or_else(|_| {
         (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build response").into_response()
     })
 }

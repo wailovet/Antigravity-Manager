@@ -701,17 +701,25 @@ fn build_generation_config(
         config["candidateCount"] = json!(1);
     }*/
 
-    // max_tokens 映射为 maxOutputTokens
-    config["maxOutputTokens"] = json!(64000);
+    // max_tokens 映射为 maxOutputTokens (fallback to a safe default)
+    let max_tokens = claude_req.max_tokens.unwrap_or(64000);
+    config["maxOutputTokens"] = json!(max_tokens);
 
-    // [优化] 设置全局停止序列，防止流式输出冗余 (参考 done-hub)
-    config["stopSequences"] = json!([
-        "<|user|>",
-        "<|endoftext|>",
-        "<|end_of_turn|>",
-        "[DONE]",
-        "\n\nHuman:"
-    ]);
+    // Stop sequences: honor client-provided values when present, otherwise apply defaults.
+    if let Some(stop_sequences) = &claude_req.stop_sequences {
+        if !stop_sequences.is_empty() {
+            config["stopSequences"] = json!(stop_sequences);
+        }
+    } else {
+        // [优化] 设置全局停止序列，防止流式输出冗余 (参考 done-hub)
+        config["stopSequences"] = json!([
+            "<|user|>",
+            "<|endoftext|>",
+            "<|end_of_turn|>",
+            "[DONE]",
+            "\n\nHuman:"
+        ]);
+    }
 
     config
 }
@@ -733,6 +741,7 @@ mod tests {
             tools: None,
             stream: false,
             max_tokens: None,
+            stop_sequences: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -829,6 +838,7 @@ mod tests {
             tools: None,
             stream: false,
             max_tokens: None,
+            stop_sequences: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -898,6 +908,7 @@ mod tests {
             tools: None,
             stream: false,
             max_tokens: None,
+            stop_sequences: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -969,6 +980,7 @@ mod tests {
             ]),
             stream: false,
             max_tokens: None,
+            stop_sequences: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -1020,6 +1032,7 @@ mod tests {
             tools: None,
             stream: false,
             max_tokens: None,
+            stop_sequences: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -1069,6 +1082,7 @@ mod tests {
             tools: None,
             stream: false,
             max_tokens: None,
+            stop_sequences: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -1111,6 +1125,7 @@ mod tests {
             tools: None,
             stream: false,
             max_tokens: None,
+            stop_sequences: None,
             temperature: None,
             top_p: None,
             top_k: None,

@@ -347,7 +347,8 @@ pub async fn handle_messages(
     };
 
     // [CRITICAL REFACTOR] 优先解析并过滤 Thinking 块，确保 z.ai 也是用修复后的 Body
-    let mut request: crate::proxy::mappers::claude::models::ClaudeRequest = match serde_json::from_value(body) {
+    let mut raw_body = body;
+    let mut request: crate::proxy::mappers::claude::models::ClaudeRequest = match serde_json::from_value(raw_body.clone()) {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -367,21 +368,36 @@ pub async fn handle_messages(
     filter_invalid_thinking_blocks(&mut request.messages);
 
     if use_zai {
-        // 重新序列化修复后的请求体
-        let new_body = match serde_json::to_value(&request) {
+        // Preserve unknown top-level fields (OpenCode payloads) while replacing messages with sanitized blocks.
+        let messages_value = match serde_json::to_value(&request.messages) {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!("Failed to serialize fixed request for z.ai: {}", e);
+                tracing::error!("Failed to serialize sanitized messages for z.ai: {}", e);
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
+        if let Some(obj) = raw_body.as_object_mut() {
+            obj.insert("messages".to_string(), messages_value);
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Invalid request body: expected JSON object"
+                    }
+                }))
+            )
+                .into_response();
+        }
 
         let mut resp = crate::proxy::providers::zai_anthropic::forward_anthropic_json(
             &state,
             axum::http::Method::POST,
             "/v1/messages",
             &headers,
-            new_body,
+            raw_body,
         )
         .await;
         attach_attribution(&mut resp, "zai", None, None);
