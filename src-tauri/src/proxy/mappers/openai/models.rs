@@ -95,6 +95,8 @@ pub struct OpenAIResponse {
     pub created: u64,
     pub model: String,
     pub choices: Vec<Choice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,4 +104,11 @@ pub struct Choice {
     pub index: u32,
     pub message: OpenAIMessage,
     pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Usage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
 }

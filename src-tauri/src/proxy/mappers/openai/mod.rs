@@ -5,6 +5,8 @@ pub mod models;
 pub mod request;
 pub mod response;
 pub mod streaming;
+pub mod utils;
+pub mod gemini_models;
 
 pub use models::*;
 pub use request::*;

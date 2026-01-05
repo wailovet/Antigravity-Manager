@@ -54,9 +54,11 @@ pub fn create_openai_sse_stream(
     mut gemini_stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     model: String,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> {
-    let mut buffer = BytesMut::new();
-    
+    let stream_id = format!("chatcmpl-{}", Uuid::new_v4());
+    let mut final_usage = None;
+
     let stream = async_stream::stream! {
+        let mut buffer = BytesMut::new();
         while let Some(item) = gemini_stream.next().await {
             match item {
                 Ok(bytes) => {
@@ -87,6 +89,13 @@ pub fn create_openai_sse_stream(
                                     } else {
                                         json
                                     };
+
+                                    // 尝试捕获 UsageMetadata
+                                    if let Some(u) = actual_data.get("usageMetadata") {
+                                        if let Ok(usage_meta) = serde_json::from_value::<super::gemini_models::UsageMetadata>(u.clone()) {
+                                            final_usage = Some(super::utils::to_openai_usage(&usage_meta));
+                                        }
+                                    }
 
                                     // Extract components
                                     let candidates = actual_data.get("candidates").and_then(|c| c.as_array());
@@ -168,7 +177,7 @@ pub fn create_openai_sse_stream(
 
                                     // Construct OpenAI SSE chunk
                                     let openai_chunk = json!({
-                                        "id": format!("chatcmpl-{}", Uuid::new_v4()),
+                                        "id": stream_id,
                                         "object": "chat.completion.chunk",
                                         "created": Utc::now().timestamp(),
                                         "model": model,
@@ -195,6 +204,21 @@ pub fn create_openai_sse_stream(
                 }
             }
         }
+
+        // Emit final usage if available
+        if let Some(usage) = final_usage {
+             let usage_chunk = json!({
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": Utc::now().timestamp(),
+                "model": model,
+                "choices": [],
+                "usage": usage
+            });
+            let sse_out = format!("data: {}\n\n", serde_json::to_string(&usage_chunk).unwrap_or_default());
+            yield Ok::<Bytes, String>(Bytes::from(sse_out));
+        }
+
         // End of stream signal for OpenAI
         yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
     };
