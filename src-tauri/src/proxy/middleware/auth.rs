@@ -122,7 +122,7 @@ mod tests {
             .layer(axum::middleware::from_fn_with_state(state, auth_middleware))
     }
 
-    async fn call(app: Router, method: axum::http::Method, path: &str, headers: Vec<(&str, &str)>) -> StatusCode {
+    async fn call(app: &Router, method: axum::http::Method, path: &str, headers: Vec<(&str, &str)>) -> StatusCode {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
@@ -132,7 +132,7 @@ mod tests {
             req = req.header(k, v);
         }
         let req = req.body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
         resp.status()
     }
 
@@ -144,9 +144,9 @@ mod tests {
             allow_lan_access: false,
         });
 
-        assert_eq!(call(app.clone(), axum::http::Method::GET, "/health", vec![]).await, StatusCode::OK);
-        assert_eq!(call(app.clone(), axum::http::Method::GET, "/healthz", vec![]).await, StatusCode::OK);
-        assert_eq!(call(app, axum::http::Method::POST, "/v1/messages", vec![]).await, StatusCode::OK);
+        assert_eq!(call(&app, axum::http::Method::GET, "/health", vec![]).await, StatusCode::OK);
+        assert_eq!(call(&app, axum::http::Method::GET, "/healthz", vec![]).await, StatusCode::OK);
+        assert_eq!(call(&app, axum::http::Method::POST, "/v1/messages", vec![]).await, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -158,13 +158,13 @@ mod tests {
             allow_lan_access: false,
         });
 
-        assert_eq!(call(app.clone(), axum::http::Method::GET, "/health", vec![]).await, StatusCode::UNAUTHORIZED);
-        assert_eq!(call(app.clone(), axum::http::Method::GET, "/healthz", vec![]).await, StatusCode::UNAUTHORIZED);
-        assert_eq!(call(app.clone(), axum::http::Method::POST, "/v1/messages", vec![]).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(call(&app, axum::http::Method::GET, "/health", vec![]).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(call(&app, axum::http::Method::GET, "/healthz", vec![]).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(call(&app, axum::http::Method::POST, "/v1/messages", vec![]).await, StatusCode::UNAUTHORIZED);
 
         assert_eq!(
             call(
-                app.clone(),
+                &app,
                 axum::http::Method::POST,
                 "/v1/messages",
                 vec![(header::AUTHORIZATION.as_str(), &format!("Bearer {}", key))],
@@ -174,23 +174,23 @@ mod tests {
         );
 
         assert_eq!(
-            call(app.clone(), axum::http::Method::POST, "/v1/messages", vec![(header::AUTHORIZATION.as_str(), key)]).await,
+            call(&app, axum::http::Method::POST, "/v1/messages", vec![(header::AUTHORIZATION.as_str(), key)]).await,
             StatusCode::OK
         );
 
         assert_eq!(
-            call(app, axum::http::Method::POST, "/v1/messages", vec![("x-api-key", key)]).await,
+            call(&app, axum::http::Method::POST, "/v1/messages", vec![("x-api-key", key)]).await,
             StatusCode::OK
         );
 
         assert_eq!(
-            call(app.clone(), axum::http::Method::POST, "/v1/messages", vec![("api-key", key)]).await,
+            call(&app, axum::http::Method::POST, "/v1/messages", vec![("api-key", key)]).await,
             StatusCode::OK
         );
 
         assert_eq!(
             call(
-                app.clone(),
+                &app,
                 axum::http::Method::POST,
                 "/v1/messages",
                 vec![("x-goog-api-key", key)],
@@ -201,7 +201,7 @@ mod tests {
 
         assert_eq!(
             call(
-                app.clone(),
+                &app,
                 axum::http::Method::POST,
                 "/v1/messages",
                 vec![("x-google-api-key", key)],
@@ -212,7 +212,7 @@ mod tests {
 
         assert_eq!(
             call(
-                app,
+                &app,
                 axum::http::Method::POST,
                 "/v1/messages?key=sk-test",
                 vec![],
@@ -231,12 +231,12 @@ mod tests {
             allow_lan_access: false,
         });
 
-        assert_eq!(call(app.clone(), axum::http::Method::GET, "/health", vec![]).await, StatusCode::OK);
-        assert_eq!(call(app.clone(), axum::http::Method::GET, "/healthz", vec![]).await, StatusCode::OK);
+        assert_eq!(call(&app, axum::http::Method::GET, "/health", vec![]).await, StatusCode::OK);
+        assert_eq!(call(&app, axum::http::Method::GET, "/healthz", vec![]).await, StatusCode::OK);
         // Health stays open even if a wrong auth header is present.
         assert_eq!(
             call(
-                app.clone(),
+                &app,
                 axum::http::Method::GET,
                 "/healthz",
                 vec![(header::AUTHORIZATION.as_str(), "Bearer sk-wrong")],
@@ -246,7 +246,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                app.clone(),
+                &app,
                 axum::http::Method::GET,
                 "/health",
                 vec![(header::AUTHORIZATION.as_str(), "Bearer sk-wrong")],
@@ -254,10 +254,10 @@ mod tests {
             .await,
             StatusCode::OK
         );
-        assert_eq!(call(app.clone(), axum::http::Method::POST, "/v1/messages", vec![]).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(call(&app, axum::http::Method::POST, "/v1/messages", vec![]).await, StatusCode::UNAUTHORIZED);
         assert_eq!(
             call(
-                app,
+                &app,
                 axum::http::Method::POST,
                 "/v1/messages",
                 vec![(header::AUTHORIZATION.as_str(), &format!("Bearer {}", key))],
@@ -276,20 +276,20 @@ mod tests {
             api_key: key.to_string(),
             allow_lan_access: false,
         });
-        assert_eq!(call(app_local.clone(), axum::http::Method::GET, "/health", vec![]).await, StatusCode::OK);
-        assert_eq!(call(app_local, axum::http::Method::POST, "/v1/messages", vec![]).await, StatusCode::OK);
+        assert_eq!(call(&app_local, axum::http::Method::GET, "/health", vec![]).await, StatusCode::OK);
+        assert_eq!(call(&app_local, axum::http::Method::POST, "/v1/messages", vec![]).await, StatusCode::OK);
 
         let app_lan = test_app(ProxySecurityConfig {
             auth_mode: ProxyAuthMode::Auto,
             api_key: key.to_string(),
             allow_lan_access: true,
         });
-        assert_eq!(call(app_lan.clone(), axum::http::Method::GET, "/health", vec![]).await, StatusCode::OK);
-        assert_eq!(call(app_lan.clone(), axum::http::Method::GET, "/healthz", vec![]).await, StatusCode::OK);
+        assert_eq!(call(&app_lan, axum::http::Method::GET, "/health", vec![]).await, StatusCode::OK);
+        assert_eq!(call(&app_lan, axum::http::Method::GET, "/healthz", vec![]).await, StatusCode::OK);
         // Health stays open in auto(lan) even if a wrong auth header is present.
         assert_eq!(
             call(
-                app_lan.clone(),
+                &app_lan,
                 axum::http::Method::GET,
                 "/healthz",
                 vec![(header::AUTHORIZATION.as_str(), "Bearer sk-wrong")],
@@ -299,7 +299,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                app_lan.clone(),
+                &app_lan,
                 axum::http::Method::GET,
                 "/health",
                 vec![(header::AUTHORIZATION.as_str(), "Bearer sk-wrong")],
@@ -307,7 +307,7 @@ mod tests {
             .await,
             StatusCode::OK
         );
-        assert_eq!(call(app_lan, axum::http::Method::POST, "/v1/messages", vec![]).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(call(&app_lan, axum::http::Method::POST, "/v1/messages", vec![]).await, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -318,10 +318,7 @@ mod tests {
             allow_lan_access: false,
         });
 
-        assert_eq!(
-            call(app, axum::http::Method::OPTIONS, "/v1/messages", vec![]).await,
-            StatusCode::OK
-        );
+        assert_eq!(call(&app, axum::http::Method::OPTIONS, "/v1/messages", vec![]).await, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -334,7 +331,7 @@ mod tests {
 
         assert_eq!(
             call(
-                app,
+                &app,
                 axum::http::Method::POST,
                 "/v1/messages",
                 vec![(header::AUTHORIZATION.as_str(), "Bearer sk-any")],
