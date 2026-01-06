@@ -386,7 +386,12 @@ pub async fn handle_messages(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    tracing::error!(">>> [RED ALERT] handle_messages called! Body JSON len: {}", body.to_string().len());
+    if state.monitor.is_enabled() {
+        tracing::info!(
+            ">>> [RED ALERT] handle_messages called! Body JSON len: {}",
+            body.to_string().len()
+        );
+    }
     
     // 生成随机 Trace ID 用户追踪
     let trace_id: String = rand::Rng::sample_iter(rand::thread_rng(), &rand::distributions::Alphanumeric)
