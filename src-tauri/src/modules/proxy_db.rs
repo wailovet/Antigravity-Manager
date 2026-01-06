@@ -1,6 +1,11 @@
 use rusqlite::{params, Connection};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::path::PathBuf;
 use crate::proxy::monitor::ProxyRequestLog;
+
+const LOG_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+const LOG_CLEANUP_INTERVAL_SECS: i64 = 60 * 60;
+static LAST_LOG_CLEANUP_TS: AtomicI64 = AtomicI64::new(0);
 
 pub fn get_proxy_db_path() -> Result<PathBuf, String> {
     let data_dir = crate::modules::account::get_data_dir()?;
@@ -47,6 +52,10 @@ pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
     let db_path = get_proxy_db_path()?;
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
 
+    if let Err(e) = purge_logs_if_needed(&conn, log.timestamp) {
+        tracing::warn!("Failed to purge old proxy logs: {}", e);
+    }
+
     conn.execute(
         "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, provider, resolved_model, account_id, account_email_masked, error, request_body, response_body, input_tokens, output_tokens)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
@@ -69,6 +78,28 @@ pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
             log.output_tokens,
         ],
     ).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+fn purge_logs_if_needed(conn: &Connection, now: i64) -> Result<(), String> {
+    let last = LAST_LOG_CLEANUP_TS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < LOG_CLEANUP_INTERVAL_SECS {
+        return Ok(());
+    }
+    if LAST_LOG_CLEANUP_TS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    let cutoff = now.saturating_sub(LOG_RETENTION_SECS);
+    conn.execute(
+        "DELETE FROM request_logs WHERE timestamp < ?1",
+        params![cutoff],
+    )
+    .map_err(|e| e.to_string())?;
 
     Ok(())
 }
