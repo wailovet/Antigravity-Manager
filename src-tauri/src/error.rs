@@ -24,6 +24,9 @@ pub enum AppError {
     #[error("Account error: {0}")]
     Account(String),
 
+    #[error("Throttled: {0}")]
+    Throttled(String),
+
     #[error("Unknown error: {0}")]
     Unknown(String),
 }

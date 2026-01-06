@@ -1,4 +1,5 @@
 use axum::{
+    body::Body,
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -32,6 +33,102 @@ pub fn anthropic_error(status: StatusCode, error_type: &'static str, message: im
         })),
     )
         .into_response()
+}
+
+fn sse_error_response(status: StatusCode, payload: Value) -> Response {
+    let data = format!("event: error\ndata: {}\n\n", payload);
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(Body::from(data))
+        .unwrap()
+        .into_response()
+}
+
+pub fn anthropic_sse_error(
+    status: StatusCode,
+    error_type: &'static str,
+    message: impl Into<String>,
+) -> Response {
+    let message = message.into();
+    sse_error_response(
+        status,
+        json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": message
+            }
+        }),
+    )
+}
+
+pub fn openai_error(status: StatusCode, message: impl Into<String>) -> Response {
+    let message = message.into();
+    (
+        status,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "insufficient_quota",
+                "code": "quota_exhausted"
+            }
+        })),
+    )
+        .into_response()
+}
+
+pub fn openai_sse_error(status: StatusCode, message: impl Into<String>) -> Response {
+    let message = message.into();
+    sse_error_response(
+        status,
+        json!({
+            "error": {
+                "message": message,
+                "type": "insufficient_quota",
+                "code": "quota_exhausted"
+            }
+        }),
+    )
+}
+
+pub fn gemini_error(status: StatusCode, message: impl Into<String>) -> Response {
+    let message = message.into();
+    (
+        status,
+        Json(json!({
+            "error": {
+                "code": status.as_u16(),
+                "status": match status {
+                    StatusCode::TOO_MANY_REQUESTS => "RESOURCE_EXHAUSTED",
+                    StatusCode::SERVICE_UNAVAILABLE => "UNAVAILABLE",
+                    _ => "ERROR"
+                },
+                "message": message
+            }
+        })),
+    )
+        .into_response()
+}
+
+pub fn gemini_sse_error(status: StatusCode, message: impl Into<String>) -> Response {
+    let message = message.into();
+    sse_error_response(
+        status,
+        json!({
+            "error": {
+                "code": status.as_u16(),
+                "status": match status {
+                    StatusCode::TOO_MANY_REQUESTS => "RESOURCE_EXHAUSTED",
+                    StatusCode::SERVICE_UNAVAILABLE => "UNAVAILABLE",
+                    _ => "ERROR"
+                },
+                "message": message
+            }
+        }),
+    )
 }
 
 pub fn summarize_for_log(body_text: &str) -> String {

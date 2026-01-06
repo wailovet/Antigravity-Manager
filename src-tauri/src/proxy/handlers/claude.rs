@@ -619,6 +619,17 @@ pub async fn handle_messages(
             .as_ref()
             .map(|t| t.type_ == "enabled")
             .unwrap_or(false);
+        let min_percent = if thinking_enabled {
+            if availability.has_healthy_thinking_models {
+                crate::proxy::common::model_mapping::LOW_QUOTA_THRESHOLD_PERCENT
+            } else {
+                0
+            }
+        } else if availability.has_healthy_models {
+            crate::proxy::common::model_mapping::LOW_QUOTA_THRESHOLD_PERCENT
+        } else {
+            0
+        };
         let routing_model = derive_claude_routing_model(&request_for_body.model, thinking_enabled);
 
         // 2. 模型路由与配置解析 (提前解析以确定请求类型)
@@ -630,6 +641,7 @@ pub async fn handle_messages(
             &*state.anthropic_mapping.read().await,
             false,  // 先不应用家族映射
             Some(&availability),
+            min_percent,
         );
         
         // 将 Claude 工具转为 Value 数组以便探测联网
@@ -653,6 +665,7 @@ pub async fn handle_messages(
                 &*state.anthropic_mapping.read().await,
                 true,  // CLI 请求应用家族映射
                 Some(&availability),
+                min_percent,
             )
         } else {
             // 非 CLI 请求：使用初步的 mapped_model（已跳过家族映射）
@@ -664,35 +677,11 @@ pub async fn handle_messages(
         let session_id_str = crate::proxy::session_manager::SessionManager::extract_session_id(&request_for_body);
         let session_id = Some(session_id_str.as_str());
 
-        let force_rotate_token = attempt > 0;
-        let (access_token, project_id, email) = match token_manager.get_token(&config.request_type, force_rotate_token, session_id).await {
-            Ok(t) => t,
-            Err(e) => {
-                let safe_message = if e.contains("invalid_grant") {
-                    "OAuth refresh failed (invalid_grant): refresh_token likely revoked/expired; reauthorize account(s) to restore service.".to_string()
-                } else {
-                    e
-                };
-                 return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({
-                        "type": "error",
-                        "error": {
-                            "type": "overloaded_error",
-                            "message": format!("No available accounts: {}", safe_message)
-                        }
-                    }))
-                ).into_response();
-            }
-        };
-
-        info!("✓ Using account: {} (type: {})", email, config.request_type);
-        
-        
         // ===== 【优化】后台任务智能检测与降级 =====
         // 使用新的检测系统，支持 5 大类关键词和多 Flash 模型策略
         let background_task_type = detect_background_task_type(&request_for_body);
-        let can_use_requested = availability.is_model_available(&mapped_model) || availability.has_unknown_quota;
+        let can_use_requested =
+            availability.is_model_available_with_min_percent(&mapped_model, min_percent);
         
         // 传递映射后的模型名
         let mut request_with_mapped = request_for_body.clone();
@@ -709,7 +698,7 @@ pub async fn handle_messages(
                 // 检测到后台任务,强制降级到 Flash 模型
                 let downgrade_model = select_background_model(task_type);
 
-                if availability.is_model_available(downgrade_model) || availability.has_unknown_quota {
+                if availability.is_model_available_with_min_percent(downgrade_model, min_percent) {
                     info!(
                         "[{}][AUTO] 检测到后台任务 (类型: {:?}),强制降级: {} -> {}",
                         trace_id,
@@ -774,6 +763,49 @@ pub async fn handle_messages(
             thinking_enabled
         );
         request_with_mapped.model = mapped_model;
+
+        let force_rotate_token = attempt > 0;
+        let (access_token, project_id, email) = match token_manager
+            .get_token(
+                &config.request_type,
+                force_rotate_token,
+                session_id,
+                Some(&request_with_mapped.model),
+                min_percent,
+            )
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                let status = match e {
+                    crate::proxy::token_manager::TokenSelectionError::ModelQuotaUnavailable { .. } => {
+                        StatusCode::TOO_MANY_REQUESTS
+                    }
+                    crate::proxy::token_manager::TokenSelectionError::NoAvailableAccounts(_) => {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                };
+                let message = if e.to_string().contains("invalid_grant") {
+                    "OAuth refresh failed (invalid_grant): refresh_token likely revoked/expired; reauthorize account(s) to restore service.".to_string()
+                } else {
+                    e.to_string()
+                };
+                if request_for_body.stream {
+                    return crate::proxy::errors::anthropic_sse_error(
+                        status,
+                        "overloaded_error",
+                        format!("No available accounts: {}", message),
+                    );
+                }
+                return crate::proxy::errors::anthropic_error(
+                    status,
+                    "overloaded_error",
+                    format!("No available accounts: {}", message),
+                );
+            }
+        };
+
+        info!("✓ Using account: {} (type: {})", email, config.request_type);
 
         // 生成 Trace ID (简单用时间戳后缀)
         // let _trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());

@@ -222,11 +222,17 @@ pub async fn refresh_all_quotas() -> Result<RefreshStats, String> {
                 }
             }
             Err(e) => {
-                failed += 1;
-                // e might be AppError, assume it implements Display
-                let msg = format!("Account {}: Fetch quota failed - {}", account.email, e);
-                details.push(msg.clone());
-                modules::logger::log_error(&msg);
+                if matches!(e, crate::error::AppError::Throttled(_)) {
+                    let msg = format!("Account {}: Quota refresh throttled", account.email);
+                    details.push(msg.clone());
+                    modules::logger::log_warn(&msg);
+                } else {
+                    failed += 1;
+                    // e might be AppError, assume it implements Display
+                    let msg = format!("Account {}: Fetch quota failed - {}", account.email, e);
+                    details.push(msg.clone());
+                    modules::logger::log_error(&msg);
+                }
             }
         }
     }

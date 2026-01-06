@@ -27,6 +27,9 @@ pub struct Account {
     /// Unix timestamp when the proxy was disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_disabled_at: Option<i64>,
+    /// Unix timestamp for the last quota refresh attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_last_attempt_at: Option<i64>,
     pub created_at: i64,
     pub last_used: i64,
 }
@@ -46,6 +49,7 @@ impl Account {
             proxy_disabled: false,
             proxy_disabled_reason: None,
             proxy_disabled_at: None,
+            quota_last_attempt_at: None,
             created_at: now,
             last_used: now,
         }

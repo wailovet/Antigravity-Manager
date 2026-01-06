@@ -62,6 +62,21 @@ pub async fn handle_generate(
     let mut last_error = String::new();
 
     for attempt in 0..max_attempts {
+        let thinking_enabled = body
+            .get("generationConfig")
+            .and_then(|v| v.get("thinkingConfig"))
+            .is_some();
+        let min_percent = if thinking_enabled {
+            if availability.has_healthy_thinking_models {
+                crate::proxy::common::model_mapping::LOW_QUOTA_THRESHOLD_PERCENT
+            } else {
+                0
+            }
+        } else if availability.has_healthy_models {
+            crate::proxy::common::model_mapping::LOW_QUOTA_THRESHOLD_PERCENT
+        } else {
+            0
+        };
         // 3. 模型路由与配置解析
         let mapped_model = crate::proxy::common::model_mapping::resolve_model_route_with_availability(
             &model_name,
@@ -70,6 +85,7 @@ pub async fn handle_generate(
             &*state.anthropic_mapping.read().await,
             false,  // Gemini 请求不应用 Claude 家族映射
             Some(&availability),
+            min_percent,
         );
         // 提取 tools 列表以进行联网探测 (Gemini 风格可能是嵌套的)
         let tools_val: Option<Vec<Value>> = body.get("tools").and_then(|t| t.as_array()).map(|arr| {
@@ -97,10 +113,33 @@ pub async fn handle_generate(
         let session_id = SessionManager::extract_gemini_session_id(&body, &model_name);
 
         // 关键：在重试尝试 (attempt > 0) 时强制轮换账号
-        let (access_token, project_id, email) = match token_manager.get_token(&config.request_type, attempt > 0, Some(&session_id)).await {
+        let (access_token, project_id, email) = match token_manager
+            .get_token(
+                &config.request_type,
+                attempt > 0,
+                Some(&session_id),
+                Some(&mapped_model),
+                min_percent,
+            )
+            .await
+        {
             Ok(t) => t,
             Err(e) => {
-                return Err((StatusCode::SERVICE_UNAVAILABLE, format!("Token error: {}", e)));
+                let status = match e {
+                    crate::proxy::token_manager::TokenSelectionError::ModelQuotaUnavailable { .. } => {
+                        StatusCode::TOO_MANY_REQUESTS
+                    }
+                    crate::proxy::token_manager::TokenSelectionError::NoAvailableAccounts(_) => {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                };
+                let message = e.to_string();
+                if is_stream {
+                    let resp = crate::proxy::errors::gemini_sse_error(status, message);
+                    return Ok(resp);
+                }
+                let resp = crate::proxy::errors::gemini_error(status, message);
+                return Ok(resp);
             }
         };
 
@@ -279,7 +318,9 @@ pub async fn handle_get_model(Path(model_name): Path<String>) -> impl IntoRespon
 
 pub async fn handle_count_tokens(State(state): State<AppState>, Path(_model_name): Path<String>, Json(_body): Json<Value>) -> Result<impl IntoResponse, (StatusCode, String)> {
     let model_group = "gemini";
-    let (_access_token, _project_id, _) = state.token_manager.get_token(model_group, false, None).await
+    let (_access_token, _project_id, _) = state.token_manager
+        .get_token(model_group, false, None, None, 0)
+        .await
         .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("Token error: {}", e)))?;
     
     Ok(Json(json!({"totalTokens": 0})))

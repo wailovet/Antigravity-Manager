@@ -24,6 +24,7 @@ pub mod sticky_config;     // 粘性调度配置
 pub mod session_manager;   // 会话指纹管理
 pub mod zai_auth;          // z.ai token normalization
 pub mod zai_web_tools;     // z.ai web tools helpers (URL normalization)
+pub mod errors;            // error payload helpers
 
 
 pub use config::ProxyConfig;

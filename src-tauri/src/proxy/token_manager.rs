@@ -8,8 +8,6 @@ use std::sync::Arc;
 use crate::proxy::rate_limit::RateLimitTracker;
 use crate::proxy::sticky_config::StickySessionConfig;
 
-const LOW_QUOTA_THRESHOLD_PERCENT: i32 = 5;
-
 #[derive(Debug, Clone)]
 pub struct ProxyToken {
     pub account_id: String,
@@ -23,6 +21,95 @@ pub struct ProxyToken {
     pub subscription_tier: Option<String>, // "FREE" | "PRO" | "ULTRA"
     pub quota_models: Option<HashMap<String, i32>>, // model_id -> remaining percentage
     pub quota_is_forbidden: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum QuotaUnavailableReason {
+    UnknownQuota,
+    ZeroQuota,
+    LowQuota,
+}
+
+#[derive(Debug, Clone)]
+pub enum TokenSelectionError {
+    NoAvailableAccounts(String),
+    ModelQuotaUnavailable { model: String, reason: QuotaUnavailableReason },
+}
+
+impl std::fmt::Display for TokenSelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TokenSelectionError::NoAvailableAccounts(message) => write!(f, "{}", message),
+            TokenSelectionError::ModelQuotaUnavailable { model, reason } => {
+                let reason_text = match reason {
+                    QuotaUnavailableReason::UnknownQuota => "quota unknown",
+                    QuotaUnavailableReason::ZeroQuota => "quota exhausted",
+                    QuotaUnavailableReason::LowQuota => "quota below threshold",
+                };
+                write!(f, "No available accounts for model {}: {}", model, reason_text)
+            }
+        }
+    }
+}
+
+impl std::error::Error for TokenSelectionError {}
+
+struct ModelQuotaSnapshot {
+    eligible: Vec<ProxyToken>,
+    any_known: bool,
+    any_positive: bool,
+    any_above_min: bool,
+}
+
+fn account_model_percentage(token: &ProxyToken, model: &str) -> Option<i32> {
+    let quota_models = token.quota_models.as_ref()?;
+    let mut best: Option<i32> = None;
+    for candidate in crate::proxy::common::model_mapping::expand_model_candidates(model) {
+        if let Some(percent) = quota_models.get(&candidate) {
+            if best.map_or(true, |current| *percent > current) {
+                best = Some(*percent);
+            }
+        }
+    }
+    Some(best.unwrap_or(0))
+}
+
+fn build_model_quota_snapshot(
+    tokens: &[ProxyToken],
+    model: &str,
+    min_percent: i32,
+) -> ModelQuotaSnapshot {
+    let mut eligible = Vec::new();
+    let mut any_known = false;
+    let mut any_positive = false;
+    let mut any_above_min = false;
+
+    for token in tokens {
+        if token.quota_is_forbidden {
+            continue;
+        }
+
+        match account_model_percentage(token, model) {
+            None => continue,
+            Some(percent) => {
+                any_known = true;
+                if percent > 0 {
+                    any_positive = true;
+                }
+                if percent > min_percent {
+                    any_above_min = true;
+                    eligible.push(token.clone());
+                }
+            }
+        }
+    }
+
+    ModelQuotaSnapshot {
+        eligible,
+        any_known,
+        any_positive,
+        any_above_min,
+    }
 }
 
 pub struct TokenManager {
@@ -214,6 +301,7 @@ impl TokenManager {
         let mut model_percentages: HashMap<String, i32> = HashMap::new();
         let mut has_unknown_quota = false;
         let mut has_healthy_models = false;
+        let mut has_healthy_thinking_models = false;
 
         for token in self.tokens.iter() {
             let token = token.value();
@@ -235,8 +323,13 @@ impl TokenManager {
                             models.insert(model.clone());
                         }
 
-                        if *percentage > LOW_QUOTA_THRESHOLD_PERCENT {
+                        if *percentage > crate::proxy::common::model_mapping::LOW_QUOTA_THRESHOLD_PERCENT {
                             has_healthy_models = true;
+                        }
+                        if *percentage > crate::proxy::common::model_mapping::LOW_QUOTA_THRESHOLD_PERCENT
+                            && crate::proxy::common::model_mapping::is_thinking_model_name(model)
+                        {
+                            has_healthy_thinking_models = true;
                         }
                     }
                 }
@@ -251,6 +344,7 @@ impl TokenManager {
             model_percentages,
             has_unknown_quota,
             has_healthy_models,
+            has_healthy_thinking_models,
         }
     }
     
@@ -258,11 +352,19 @@ impl TokenManager {
     /// 参数 `quota_group` 用于区分 "claude" vs "gemini" 组
     /// 参数 `force_rotate` 为 true 时将忽略锁定，强制切换账号
     /// 参数 `session_id` 用于跨请求维持会话粘性
-    pub async fn get_token(&self, quota_group: &str, force_rotate: bool, session_id: Option<&str>) -> Result<(String, String, String), String> {
+    pub async fn get_token(
+        &self,
+        quota_group: &str,
+        force_rotate: bool,
+        session_id: Option<&str>,
+        requested_model: Option<&str>,
+        min_percent: i32,
+    ) -> Result<(String, String, String), TokenSelectionError> {
         let mut tokens_snapshot: Vec<ProxyToken> = self.tokens.iter().map(|e| e.value().clone()).collect();
-        let total = tokens_snapshot.len();
-        if total == 0 {
-            return Err("Token pool is empty".to_string());
+        if tokens_snapshot.is_empty() {
+            return Err(TokenSelectionError::NoAvailableAccounts(
+                "Token pool is empty".to_string(),
+            ));
         }
 
         // ===== 【优化】根据订阅等级排序 (优先级: ULTRA > PRO > FREE) =====
@@ -276,6 +378,38 @@ impl TokenManager {
             };
             tier_priority(&a.subscription_tier).cmp(&tier_priority(&b.subscription_tier))
         });
+
+        let requested_model = requested_model.map(|model| model.to_string());
+        let mut eligible_account_ids: Option<HashSet<String>> = None;
+
+        if let Some(ref model) = requested_model {
+            let snapshot = build_model_quota_snapshot(&tokens_snapshot, model, min_percent);
+            if snapshot.eligible.is_empty() {
+                let reason = if !snapshot.any_known {
+                    QuotaUnavailableReason::UnknownQuota
+                } else if !snapshot.any_positive {
+                    QuotaUnavailableReason::ZeroQuota
+                } else if !snapshot.any_above_min {
+                    QuotaUnavailableReason::LowQuota
+                } else {
+                    QuotaUnavailableReason::LowQuota
+                };
+                return Err(TokenSelectionError::ModelQuotaUnavailable {
+                    model: model.clone(),
+                    reason,
+                });
+            }
+
+            tokens_snapshot = snapshot.eligible;
+            eligible_account_ids = Some(tokens_snapshot.iter().map(|t| t.account_id.clone()).collect());
+        }
+
+        let total = tokens_snapshot.len();
+        if total == 0 {
+            return Err(TokenSelectionError::NoAvailableAccounts(
+                "No eligible accounts available".to_string(),
+            ));
+        }
 
         // 0. 读取当前调度配置
         let scheduling = self.sticky_config.read().await.clone();
@@ -296,6 +430,17 @@ impl TokenManager {
                 
                 // 1. 检查会话是否已绑定账号
                 if let Some(bound_id) = self.session_accounts.get(sid).map(|v| v.clone()) {
+                    let is_eligible = eligible_account_ids
+                        .as_ref()
+                        .map_or(true, |ids| ids.contains(&bound_id));
+                    if !is_eligible {
+                        tracing::warn!(
+                            "Sticky Session: Bound account {} is not eligible for requested model. Unbinding session {}.",
+                            bound_id,
+                            sid
+                        );
+                        self.session_accounts.remove(sid);
+                    } else {
                     // 2. 检查绑定的账号是否限流 (使用精准的剩余时间接口)
                     let reset_sec = self.rate_limit_tracker.get_remaining_wait(&bound_id);
                     if reset_sec > 0 {
@@ -321,6 +466,7 @@ impl TokenManager {
                             target_token = Some(found.clone());
                         }
                     }
+                    }
                 }
             }
 
@@ -329,12 +475,30 @@ impl TokenManager {
                 let mut last_used = self.last_used_account.lock().await;
                 
                 // 尝试复用全局锁定账号
+                let mut reuse_account_id: Option<String> = None;
+                let mut clear_last_used = false;
                 if let Some((account_id, last_time)) = &*last_used {
-                    if last_time.elapsed().as_secs() < 60 && !attempted.contains(account_id) {
-                        if let Some(found) = tokens_snapshot.iter().find(|t| &t.account_id == account_id) {
-                            tracing::debug!("60s Window: Force reusing last account: {}", found.email);
-                            target_token = Some(found.clone());
+                    if let Some(ids) = eligible_account_ids.as_ref() {
+                        if !ids.contains(account_id) {
+                            clear_last_used = true;
                         }
+                    }
+                    if !clear_last_used
+                        && last_time.elapsed().as_secs() < 60
+                        && !attempted.contains(account_id)
+                    {
+                        reuse_account_id = Some(account_id.clone());
+                    }
+                }
+
+                if clear_last_used {
+                    *last_used = None;
+                }
+
+                if let Some(account_id) = reuse_account_id {
+                    if let Some(found) = tokens_snapshot.iter().find(|t| t.account_id == account_id) {
+                        tracing::debug!("60s Window: Force reusing last account: {}", found.email);
+                        target_token = Some(found.clone());
                     }
                 }
                 
@@ -399,7 +563,10 @@ impl TokenManager {
                         .min()
                         .unwrap_or(60);
                     
-                    return Err(format!("All accounts are currently limited or unhealthy. Please wait {}s.", min_wait));
+                    return Err(TokenSelectionError::NoAvailableAccounts(format!(
+                        "All accounts are currently limited or unhealthy. Please wait {}s.",
+                        min_wait
+                    )));
                 }
             };
 
@@ -491,7 +658,9 @@ impl TokenManager {
             return Ok((token.access_token, project_id, token.email));
         }
 
-        Err(last_error.unwrap_or_else(|| "All accounts failed".to_string()))
+        Err(TokenSelectionError::NoAvailableAccounts(
+            last_error.unwrap_or_else(|| "All accounts failed".to_string()),
+        ))
     }
 
     async fn disable_account(&self, account_id: &str, reason: &str) -> Result<(), String> {

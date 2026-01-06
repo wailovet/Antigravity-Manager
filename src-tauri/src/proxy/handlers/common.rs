@@ -23,6 +23,7 @@ pub async fn handle_detect_model(
         &*state.anthropic_mapping.read().await,
         false,  // Common 请求不应用 Claude 家族映射
         Some(&availability),
+        0,
     );
 
     // 2. Resolve capabilities

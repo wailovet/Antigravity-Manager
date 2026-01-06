@@ -2,7 +2,7 @@
 use std::collections::{HashMap, HashSet};
 use once_cell::sync::Lazy;
 
-const LOW_QUOTA_THRESHOLD_PERCENT: i32 = 5;
+pub const LOW_QUOTA_THRESHOLD_PERCENT: i32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct ModelAvailability {
@@ -10,30 +10,34 @@ pub struct ModelAvailability {
     pub model_percentages: HashMap<String, i32>,
     pub has_unknown_quota: bool,
     pub has_healthy_models: bool,
+    pub has_healthy_thinking_models: bool,
 }
 
 impl ModelAvailability {
     pub fn resolve_requested_model(&self, model: &str) -> Option<String> {
+        self.resolve_requested_model_with_min_percent(model, 0)
+    }
+
+    pub fn is_model_available(&self, model: &str) -> bool {
+        self.is_model_available_with_min_percent(model, 0)
+    }
+
+    pub fn can_use_original(&self, model: &str) -> bool {
+        self.resolve_requested_model(model).is_some()
+    }
+
+    pub fn resolve_requested_model_with_min_percent(
+        &self,
+        model: &str,
+        min_percent: i32,
+    ) -> Option<String> {
         let candidates = expand_model_candidates(model);
         if candidates.is_empty() {
             return None;
         }
 
-        if self.has_unknown_quota && is_pool_model_name(model) {
-            return Some(model.to_string());
-        }
-
-        if self.has_any_healthy_models() {
-            for candidate in candidates {
-                if self.is_candidate_healthy(&candidate) {
-                    return Some(candidate);
-                }
-            }
-            return None;
-        }
-
         for candidate in candidates {
-            if self.models.contains(&candidate) {
+            if self.is_model_available_with_min_percent(&candidate, min_percent) {
                 return Some(candidate);
             }
         }
@@ -41,40 +45,23 @@ impl ModelAvailability {
         None
     }
 
-    pub fn is_model_available(&self, model: &str) -> bool {
-        if self.has_unknown_quota {
-            return true;
+    pub fn is_model_available_with_min_percent(&self, model: &str, min_percent: i32) -> bool {
+        if let Some(percent) = self.best_percentage_for_model(model) {
+            return percent > min_percent;
         }
-
-        let candidates = expand_model_candidates(model);
-        if candidates.is_empty() {
-            return false;
-        }
-
-        if self.has_any_healthy_models() {
-            return candidates
-                .iter()
-                .any(|candidate| self.is_candidate_healthy(candidate));
-        }
-
-        candidates
-            .iter()
-            .any(|candidate| self.models.contains(candidate))
+        false
     }
 
-    pub fn can_use_original(&self, model: &str) -> bool {
-        self.resolve_requested_model(model).is_some()
-    }
-
-    fn has_any_healthy_models(&self) -> bool {
-        self.has_healthy_models
-    }
-
-    fn is_candidate_healthy(&self, model: &str) -> bool {
-        match self.model_percentages.get(model) {
-            Some(percent) => *percent > LOW_QUOTA_THRESHOLD_PERCENT,
-            None => false,
+    pub fn best_percentage_for_model(&self, model: &str) -> Option<i32> {
+        let mut best: Option<i32> = None;
+        for candidate in expand_model_candidates(model) {
+            if let Some(percent) = self.model_percentages.get(&candidate) {
+                if best.map_or(true, |current| *percent > current) {
+                    best = Some(*percent);
+                }
+            }
         }
+        best
     }
 }
 
@@ -92,7 +79,7 @@ fn is_pool_model_name(model: &str) -> bool {
     false
 }
 
-fn expand_model_candidates(model: &str) -> Vec<String> {
+pub(crate) fn expand_model_candidates(model: &str) -> Vec<String> {
     let trimmed = model.trim();
     if trimmed.is_empty() {
         return Vec::new();
@@ -129,6 +116,16 @@ fn expand_model_candidates(model: &str) -> Vec<String> {
     }
 
     candidates
+}
+
+pub fn is_thinking_model_name(model: &str) -> bool {
+    if model.contains("-thinking") {
+        return true;
+    }
+    matches!(
+        model,
+        "gemini-3-pro-high" | "gemini-3-pro-medium" | "gemini-3-pro-low"
+    )
 }
 
 static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
@@ -285,9 +282,10 @@ pub fn resolve_model_route_with_availability(
     anthropic_mapping: &std::collections::HashMap<String, String>,
     apply_claude_family_mapping: bool,
     availability: Option<&ModelAvailability>,
+    min_percent: i32,
 ) -> String {
     let allow_target = |target: &str| {
-        availability.map_or(true, |a| a.is_model_available(target) || a.has_unknown_quota)
+        availability.map_or(true, |a| a.is_model_available_with_min_percent(target, min_percent))
     };
 
     // 1. 检查自定义精确映射 (优先级最高)
@@ -305,7 +303,7 @@ pub fn resolve_model_route_with_availability(
 
     // 2. 如果目标模型可用，优先使用原始模型
     if let Some(availability) = availability {
-        if let Some(candidate) = availability.resolve_requested_model(original_model) {
+        if let Some(candidate) = availability.resolve_requested_model_with_min_percent(original_model, min_percent) {
             return candidate;
         }
     }
@@ -453,6 +451,7 @@ pub fn resolve_model_route(
         anthropic_mapping,
         apply_claude_family_mapping,
         None,
+        0,
     )
 }
 
