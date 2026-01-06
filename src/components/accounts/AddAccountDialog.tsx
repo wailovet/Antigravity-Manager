@@ -20,6 +20,7 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
     const [refreshToken, setRefreshToken] = useState('');
     const [oauthUrl, setOauthUrl] = useState('');
     const [oauthUrlCopied, setOauthUrlCopied] = useState(false);
+    const [oauthCallbackReceived, setOauthCallbackReceived] = useState(false);
 
     // UI State
     const [status, setStatus] = useState<Status>('idle');
@@ -31,13 +32,15 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
     const statusRef = useRef(status);
     const activeTabRef = useRef(activeTab);
     const isOpenRef = useRef(isOpen);
+    const oauthCallbackRef = useRef(oauthCallbackReceived);
 
     useEffect(() => {
         oauthUrlRef.current = oauthUrl;
         statusRef.current = status;
         activeTabRef.current = activeTab;
         isOpenRef.current = isOpen;
-    }, [oauthUrl, status, activeTab, isOpen]);
+        oauthCallbackRef.current = oauthCallbackReceived;
+    }, [oauthUrl, status, activeTab, isOpen, oauthCallbackReceived]);
 
     // Reset state when dialog opens or tab changes
     useEffect(() => {
@@ -73,7 +76,11 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
                 if (!isOpenRef.current) return;
                 if (activeTabRef.current !== 'oauth') return;
                 if (statusRef.current === 'loading' || statusRef.current === 'success') return;
+                if (oauthCallbackRef.current) return;
                 if (!oauthUrlRef.current) return;
+
+                oauthCallbackRef.current = true;
+                setOauthCallbackReceived(true);
 
                 // Auto-complete: exchange code and save account (no browser open)
                 setStatus('loading');
@@ -141,6 +148,8 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
         setRefreshToken('');
         setOauthUrl('');
         setOauthUrlCopied(false);
+        setOauthCallbackReceived(false);
+        oauthCallbackRef.current = false;
     };
 
     const handleAction = async (
@@ -274,6 +283,9 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
     };
 
     const handleCompleteOAuth = () => {
+        if (oauthCallbackRef.current) {
+            return;
+        }
         // Manual flow: user already authorized in their preferred browser, just finish the flow.
         handleAction(t('accounts.add.tabs.oauth'), completeOAuthLogin, { clearOauthUrl: false });
     };
@@ -414,7 +426,7 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
                                         <button
                                             className="w-full px-4 py-3 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-xl shadow-lg shadow-blue-500/20 transition-all flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed"
                                             onClick={handleOAuth}
-                                            disabled={status === 'loading' || status === 'success'}
+                                            disabled={oauthCallbackReceived || status === 'loading' || status === 'success'}
                                         >
                                             {status === 'loading' ? t('accounts.add.oauth.btn_waiting') : t('accounts.add.oauth.btn_start')}
                                         </button>
@@ -447,7 +459,7 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
                                                     type="button"
                                                     className="w-full px-4 py-2 bg-white dark:bg-base-100 text-gray-700 dark:text-gray-300 text-sm font-medium rounded-xl border border-gray-200 dark:border-base-300 hover:bg-gray-50 dark:hover:bg-base-200 transition-all flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed"
                                                     onClick={handleCompleteOAuth}
-                                                    disabled={status === 'loading' || status === 'success'}
+                                                    disabled={oauthCallbackReceived || status === 'loading' || status === 'success'}
                                                 >
                                                     <CheckCircle2 className="w-4 h-4" />
                                                     {t('accounts.add.oauth.btn_finish')}
