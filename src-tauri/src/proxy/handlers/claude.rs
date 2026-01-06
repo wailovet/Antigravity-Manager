@@ -770,7 +770,7 @@ pub async fn handle_messages(
         request_with_mapped.model = mapped_model;
 
         let force_rotate_token = attempt > 0;
-        let (access_token, project_id, email) = match token_manager
+        let (access_token, project_id, email, account_id) = match token_manager
             .get_token(
                 &config.request_type,
                 force_rotate_token,
@@ -969,7 +969,7 @@ pub async fn handle_messages(
         
         // 3. 标记限流状态（用于 UI 显示）
         if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
-            token_manager.mark_rate_limited(&email, status_code, retry_after.as_deref(), &error_text);
+            token_manager.mark_rate_limited(&account_id, status_code, retry_after.as_deref(), &error_text);
         }
 
         // 4. 处理 400 错误 (Thinking 签名失效)

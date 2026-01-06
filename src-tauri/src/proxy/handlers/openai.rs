@@ -256,7 +256,7 @@ pub async fn handle_chat_completions(
 
         // 4. 获取 Token (使用准确的 request_type)
         // 关键：在重试尝试 (attempt > 0) 时强制轮换账号
-        let (access_token, project_id, email) = match token_manager
+        let (access_token, project_id, email, account_id) = match token_manager
             .get_token(
                 &config.request_type,
                 attempt > 0,
@@ -374,7 +374,7 @@ pub async fn handle_chat_completions(
         // 429/529/503 智能处理
         if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
             // 记录限流信息 (全局同步)
-            token_manager.mark_rate_limited(&email, status_code, retry_after.as_deref(), &error_text);
+            token_manager.mark_rate_limited(&account_id, status_code, retry_after.as_deref(), &error_text);
 
             // 1. 优先尝试解析 RetryInfo (由 Google Cloud 直接下发)
             if let Some(delay_ms) = crate::proxy::upstream::retry::parse_retry_delay(&error_text) {
@@ -786,7 +786,7 @@ pub async fn handle_completions(
             &tools_val,
         );
 
-        let (access_token, project_id, email) = match token_manager
+        let (access_token, project_id, email, _account_id) = match token_manager
             .get_token(
                 &config.request_type,
                 false,
@@ -1027,7 +1027,7 @@ pub async fn handle_images_generations(
         0
     };
 
-    let (access_token, project_id, email) = match token_manager
+    let (access_token, project_id, email, _account_id) = match token_manager
         .get_token("image_gen", false, None, Some(model), min_percent)
         .await
     {
@@ -1291,7 +1291,7 @@ pub async fn handle_images_edits(
         0
     };
     // Fix: Proper get_token call with correct signature and unwrap (using image_gen quota)
-    let (access_token, project_id, _email) = match token_manager
+    let (access_token, project_id, _email, _account_id) = match token_manager
         .get_token("image_gen", false, None, Some(&model), min_percent)
         .await
     {

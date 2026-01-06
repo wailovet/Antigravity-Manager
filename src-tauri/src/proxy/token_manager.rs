@@ -359,7 +359,7 @@ impl TokenManager {
         session_id: Option<&str>,
         requested_model: Option<&str>,
         min_percent: i32,
-    ) -> Result<(String, String, String), TokenSelectionError> {
+    ) -> Result<(String, String, String, String), TokenSelectionError> {
         let mut tokens_snapshot: Vec<ProxyToken> = self.tokens.iter().map(|e| e.value().clone()).collect();
         if tokens_snapshot.is_empty() {
             return Err(TokenSelectionError::NoAvailableAccounts(
@@ -655,7 +655,12 @@ impl TokenManager {
                 }
             };
 
-            return Ok((token.access_token, project_id, token.email));
+            return Ok((
+                token.access_token,
+                project_id,
+                token.email,
+                token.account_id,
+            ));
         }
 
         Err(TokenSelectionError::NoAvailableAccounts(
