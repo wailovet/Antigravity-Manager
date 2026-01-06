@@ -6,12 +6,12 @@ This document captures the current routing priorities we want the proxy to enfor
 - Applies to requests handled by the Google account pool.
 - Availability is driven by pool quota snapshots:
   - If a candidate model appears in any pool account with remaining percentage > 0, it is considered available.
-  - If any account has unknown quota data, availability is treated as best-effort (unknown models may be considered available).
-  - If all accounts report quotas and a model does not appear, it is treated as unavailable.
+  - Accounts with unknown quota data are excluded from routing until their quotas are fetched.
+  - If all known accounts report quotas and a model does not appear, it is treated as unavailable.
 - z.ai is unaffected by these rules (Claude passthrough has its own mapping).
 
 ## Claude protocol (POST /v1/messages)
-We prefer one-to-one Claude family routing, with thinking preserved when possible.
+We prefer one-to-one Claude family routing, with thinking preserved when explicitly requested.
 
 Priority by family:
 - Opus:
@@ -29,6 +29,7 @@ Availability gating:
 Thinking detection:
 - `thinking.enabled` is derived from `thinking.type == "enabled"` in the Claude request.
   - Thinking may be auto-disabled when the latest assistant message includes tool_use without a matching thinking block, to avoid upstream 400s.
+- The proxy does **not** auto-enable thinking for Claude requests. If you want thinking, include the `thinking` block in the request.
 
 ## OpenAI-like requests (POST /v1/chat/completions, /v1/completions, /v1/responses)
 We route OpenAI models to the highest available Claude model, and then fall back in a strict order.
@@ -38,7 +39,7 @@ Thinking detection (OpenAI):
 - Else if `reasoning.effort` is present and not `"none"` -> thinking enabled.
 - Else if model name contains `"thinking"` -> thinking enabled.
 - Else if the model explicitly names a Claude family without thinking -> thinking disabled.
-- Default: thinking enabled.
+- Default: thinking enabled for OpenAI-like requests. To disable, set `reasoning.effort: "none"` or use a non-thinking model name.
 
 Priority chains (first available wins):
 - OpenAI models (gpt/o*):
@@ -68,6 +69,7 @@ Gemini protocol requests are passed through the Google pool directly and are **n
 Availability notes:
 - If the requested Gemini model is present in pool quotas, it is used as-is.
 - If it is not present in quotas, the resolver may fall back to default Gemini routing (based on built-in mappings), or return an upstream error if the model is unsupported.
+- The proxy does **not** auto-enable thinking for Gemini requests. If you want thinking, include `generationConfig.thinkingConfig` in the request.
 
 Recommended usage:
 - For explicit Gemini usage, request `gemini-3-pro-high` or `gemini-3-flash` directly.
