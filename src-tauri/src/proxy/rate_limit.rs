@@ -316,6 +316,14 @@ impl RateLimitTracker {
         
         None
     }
+
+    /// 获取限流记录快照
+    pub fn snapshot(&self) -> Vec<(String, RateLimitInfo)> {
+        self.limits
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
+    }
     
     /// 获取账号的限流信息
     pub fn get(&self, account_id: &str) -> Option<RateLimitInfo> {

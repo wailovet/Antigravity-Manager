@@ -1,10 +1,12 @@
 use tauri::State;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
 use crate::proxy::{ProxyConfig, TokenManager};
 use tokio::time::Duration;
 use crate::proxy::monitor::{ProxyMonitor, ProxyRequestLog, ProxyStats};
+use crate::proxy::rate_limit::RateLimitReason;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenLockSnapshot {
@@ -78,6 +80,14 @@ pub struct ProxyRuntimeStatus {
     pub recent: Vec<ProxyAttributionEvent>,
     pub per_provider: Vec<ProviderAggregate>,
     pub per_account: Vec<AccountAggregate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitStatus {
+    pub account_id: String,
+    pub reason: String,
+    pub reset_at: i64,
+    pub remaining_seconds: u64,
 }
 
 
@@ -439,6 +449,45 @@ pub async fn get_proxy_runtime_status(
     })
 }
 
+#[tauri::command]
+pub async fn get_proxy_rate_limits(
+    state: State<'_, ProxyServiceState>,
+) -> Result<Vec<RateLimitStatus>, String> {
+    let instance_lock = state.instance.read().await;
+    let instance = match instance_lock.as_ref() {
+        Some(instance) => instance,
+        None => return Ok(Vec::new()),
+    };
+
+    let now = SystemTime::now();
+    let snapshot = instance.token_manager.get_rate_limit_snapshot();
+    let mut out = Vec::with_capacity(snapshot.len());
+
+    for (account_id, info) in snapshot {
+        let remaining = match info.reset_time.duration_since(now) {
+            Ok(duration) => duration.as_secs(),
+            Err(_) => 0,
+        };
+        if remaining == 0 {
+            continue;
+        }
+        let reset_at = info
+            .reset_time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        out.push(RateLimitStatus {
+            account_id,
+            reason: rate_limit_reason_code(info.reason).to_string(),
+            reset_at,
+            remaining_seconds: remaining,
+        });
+    }
+
+    Ok(out)
+}
+
 /// 生成 API Key
 #[tauri::command]
 pub fn generate_api_key() -> String {
@@ -495,6 +544,15 @@ fn join_base_url(base: &str, path: &str) -> String {
         format!("/{}", path)
     };
     format!("{}{}", base, path)
+}
+
+fn rate_limit_reason_code(reason: RateLimitReason) -> &'static str {
+    match reason {
+        RateLimitReason::QuotaExhausted => "quota_exhausted",
+        RateLimitReason::RateLimitExceeded => "rate_limit_exceeded",
+        RateLimitReason::ServerError => "server_error",
+        RateLimitReason::Unknown => "unknown",
+    }
 }
 
 fn extract_model_ids(value: &serde_json::Value) -> Vec<String> {

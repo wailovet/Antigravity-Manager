@@ -91,3 +91,24 @@ export function formatCompactNumber(num: number): string {
     const formatted = value.toFixed(Math.abs(value) < 10 && i > 0 ? 1 : 0);
     return `${formatted.replace(/\.0$/, '')}${units[i]}`;
 }
+
+export function formatDurationSeconds(totalSeconds: number): string {
+    if (totalSeconds <= 0) return '0s';
+
+    const seconds = Math.floor(totalSeconds);
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remainingSeconds = seconds % 60;
+
+    if (days > 0) {
+        return `${days}d ${hours}h`;
+    }
+    if (hours > 0) {
+        return `${hours}h ${minutes}m`;
+    }
+    if (minutes > 0) {
+        return `${minutes}m ${remainingSeconds}s`;
+    }
+    return `${remainingSeconds}s`;
+}

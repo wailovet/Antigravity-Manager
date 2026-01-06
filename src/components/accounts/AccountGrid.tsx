@@ -1,8 +1,10 @@
 import { Account } from '../../types/account';
+import { RateLimitStatus } from '../../types/rateLimit';
 import AccountCard from './AccountCard';
 
 interface AccountGridProps {
     accounts: Account[];
+    rateLimits: Record<string, RateLimitStatus>;
     selectedIds: Set<string>;
     refreshingIds: Set<string>;
     onToggleSelect: (id: string) => void;
@@ -17,7 +19,7 @@ interface AccountGridProps {
 }
 
 
-function AccountGrid({ accounts, selectedIds, refreshingIds, onToggleSelect, currentAccountId, switchingAccountId, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy }: AccountGridProps) {
+function AccountGrid({ accounts, rateLimits, selectedIds, refreshingIds, onToggleSelect, currentAccountId, switchingAccountId, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy }: AccountGridProps) {
     if (accounts.length === 0) {
         return (
             <div className="bg-white dark:bg-base-100 rounded-2xl p-12 shadow-sm border border-gray-100 dark:border-base-200 text-center">
@@ -33,6 +35,7 @@ function AccountGrid({ accounts, selectedIds, refreshingIds, onToggleSelect, cur
                 <AccountCard
                     key={account.id}
                     account={account}
+                    rateLimit={rateLimits[account.id]}
                     selected={selectedIds.has(account.id)}
                     isRefreshing={refreshingIds.has(account.id)}
                     onSelect={() => onToggleSelect(account.id)}

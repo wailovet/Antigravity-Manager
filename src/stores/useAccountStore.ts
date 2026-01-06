@@ -1,12 +1,17 @@
 import { create } from 'zustand';
 import { Account } from '../types/account';
+import { RateLimitStatus } from '../types/rateLimit';
 import * as accountService from '../services/accountService';
+import * as proxyService from '../services/proxyService';
 
 interface AccountState {
     accounts: Account[];
     currentAccount: Account | null;
     loading: boolean;
     error: string | null;
+    rateLimits: Record<string, RateLimitStatus>;
+    rateLimitLoading: boolean;
+    rateLimitError: string | null;
 
     // Actions
     fetchAccounts: () => Promise<void>;
@@ -28,6 +33,7 @@ interface AccountState {
     importFromCustomDb: (path: string) => Promise<void>;
     syncAccountFromDb: () => Promise<void>;
     toggleProxyStatus: (accountId: string, enable: boolean, reason?: string) => Promise<void>;
+    fetchRateLimits: () => Promise<void>;
 }
 
 export const useAccountStore = create<AccountState>((set, get) => ({
@@ -35,6 +41,9 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     currentAccount: null,
     loading: false,
     error: null,
+    rateLimits: {},
+    rateLimitLoading: false,
+    rateLimitError: null,
 
     fetchAccounts: async () => {
         set({ loading: true, error: null });
@@ -264,6 +273,21 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         } catch (error) {
             console.error('[AccountStore] Toggle proxy status failed:', error);
             throw error;
+        }
+    },
+
+    fetchRateLimits: async () => {
+        set({ rateLimitLoading: true, rateLimitError: null });
+        try {
+            const statuses = await proxyService.getProxyRateLimits();
+            const map = statuses.reduce<Record<string, RateLimitStatus>>((acc, status) => {
+                acc[status.account_id] = status;
+                return acc;
+            }, {});
+            set({ rateLimits: map, rateLimitLoading: false });
+        } catch (error) {
+            console.error('[AccountStore] Fetch rate limits failed:', error);
+            set({ rateLimitError: String(error), rateLimitLoading: false });
         }
     },
 }));

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::proxy::rate_limit::RateLimitTracker;
+use crate::proxy::rate_limit::{RateLimitInfo, RateLimitTracker};
 use crate::proxy::sticky_config::StickySessionConfig;
 
 #[derive(Debug, Clone)]
@@ -781,6 +781,12 @@ impl TokenManager {
     #[allow(dead_code)]
     pub fn clear_rate_limit(&self, account_id: &str) -> bool {
         self.rate_limit_tracker.clear(account_id)
+    }
+
+    /// 获取当前限流记录快照
+    pub fn get_rate_limit_snapshot(&self) -> Vec<(String, RateLimitInfo)> {
+        self.rate_limit_tracker.cleanup_expired();
+        self.rate_limit_tracker.snapshot()
     }
 
     // ===== 调度配置相关方法 =====

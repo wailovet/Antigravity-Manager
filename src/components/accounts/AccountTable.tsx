@@ -39,9 +39,10 @@ import {
     ToggleRight,
 } from 'lucide-react';
 import { Account } from '../../types/account';
+import { RateLimitStatus } from '../../types/rateLimit';
 import { useTranslation } from 'react-i18next';
 import { cn } from '../../utils/cn';
-import { getQuotaColor, formatTimeRemaining, getTimeRemainingColor } from '../../utils/format';
+import { getQuotaColor, formatTimeRemaining, getTimeRemainingColor, formatDurationSeconds, formatDate } from '../../utils/format';
 
 // ============================================================================
 // 类型定义
@@ -49,6 +50,7 @@ import { getQuotaColor, formatTimeRemaining, getTimeRemainingColor } from '../..
 
 interface AccountTableProps {
     accounts: Account[];
+    rateLimits: Record<string, RateLimitStatus>;
     selectedIds: Set<string>;
     refreshingIds: Set<string>;
     onToggleSelect: (id: string) => void;
@@ -67,6 +69,7 @@ interface AccountTableProps {
 
 interface SortableRowProps {
     account: Account;
+    rateLimit?: RateLimitStatus;
     selected: boolean;
     isRefreshing: boolean;
     isCurrent: boolean;
@@ -83,6 +86,7 @@ interface SortableRowProps {
 
 interface AccountRowContentProps {
     account: Account;
+    rateLimit?: RateLimitStatus;
     isCurrent: boolean;
     isRefreshing: boolean;
     isSwitching: boolean;
@@ -133,6 +137,7 @@ function getTimeColorClass(resetTime: string | undefined): string {
  */
 function SortableAccountRow({
     account,
+    rateLimit,
     selected,
     isRefreshing,
     isCurrent,
@@ -197,6 +202,7 @@ function SortableAccountRow({
             </td>
             <AccountRowContent
                 account={account}
+                rateLimit={rateLimit}
                 isCurrent={isCurrent}
                 isRefreshing={isRefreshing}
                 isSwitching={isSwitching}
@@ -217,6 +223,7 @@ function SortableAccountRow({
  */
 function AccountRowContent({
     account,
+    rateLimit,
     isCurrent,
     isRefreshing,
     isSwitching,
@@ -233,6 +240,8 @@ function AccountRowContent({
     const geminiImageModel = account.quota?.models.find(m => m.name.toLowerCase() === 'gemini-3-pro-image');
     const claudeModel = account.quota?.models.find(m => m.name.toLowerCase() === 'claude-sonnet-4-5-thinking');
     const isDisabled = Boolean(account.disabled);
+    const rateLimitReason = rateLimit ? t(`accounts.rate_limit_reasons.${rateLimit.reason}`) : '';
+    const rateLimitReset = rateLimit ? formatDate(rateLimit.reset_at) : null;
 
     return (
         <>
@@ -277,6 +286,16 @@ function AccountRowContent({
                             <span className="px-2 py-0.5 rounded-md bg-red-100 dark:bg-red-900/50 text-red-600 dark:text-red-400 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-red-200/50" title={t('accounts.forbidden_tooltip')}>
                                 <Lock className="w-2.5 h-2.5" />
                                 <span>{t('accounts.forbidden')}</span>
+                            </span>
+                        )}
+
+                        {rateLimit && (
+                            <span
+                                className="px-2 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-amber-200/50"
+                                title={`${t('accounts.rate_limit_reason')}: ${rateLimitReason}${rateLimitReset ? ` • ${t('accounts.rate_limit_reset')}: ${rateLimitReset}` : ''}`}
+                            >
+                                <Clock className="w-2.5 h-2.5" />
+                                <span>{t('accounts.rate_limit_badge', { time: formatDurationSeconds(rateLimit.remaining_seconds) })}</span>
                             </span>
                         )}
 
@@ -522,6 +541,7 @@ function AccountRowContent({
  */
 function AccountTable({
     accounts,
+    rateLimits,
     selectedIds,
     refreshingIds,
     onToggleSelect,
@@ -613,6 +633,7 @@ function AccountTable({
                                 <SortableAccountRow
                                     key={account.id}
                                     account={account}
+                                    rateLimit={rateLimits[account.id]}
                                     selected={selectedIds.has(account.id)}
                                     isRefreshing={refreshingIds.has(account.id)}
                                     isCurrent={account.id === currentAccountId}
@@ -653,6 +674,7 @@ function AccountTable({
                                 </td>
                                 <AccountRowContent
                                     account={activeAccount}
+                                    rateLimit={rateLimits[activeAccount.id]}
                                     isCurrent={activeAccount.id === currentAccountId}
                                     isRefreshing={refreshingIds.has(activeAccount.id)}
                                     isSwitching={activeAccount.id === switchingAccountId}

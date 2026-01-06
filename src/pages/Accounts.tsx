@@ -34,6 +34,7 @@ function Accounts() {
         refreshQuota,
         toggleProxyStatus,
         reorderAccounts,
+        rateLimits,
     } = useAccountStore();
     const { config } = useConfigStore();
 
@@ -647,6 +648,7 @@ function Accounts() {
                         <div className="flex-1 overflow-y-auto">
                             <AccountTable
                                 accounts={paginatedAccounts}
+                                rateLimits={rateLimits}
                                 selectedIds={selectedIds}
                                 refreshingIds={refreshingIds}
                                 onToggleSelect={handleToggleSelect}
@@ -667,6 +669,7 @@ function Accounts() {
                     <div className="h-full overflow-y-auto">
                         <AccountGrid
                             accounts={paginatedAccounts}
+                            rateLimits={rateLimits}
                             selectedIds={selectedIds}
                             refreshingIds={refreshingIds}
                             onToggleSelect={handleToggleSelect}
@@ -705,6 +708,7 @@ function Accounts() {
 
             <AccountDetailsDialog
                 account={detailsAccount}
+                rateLimit={detailsAccount ? rateLimits[detailsAccount.id] : null}
                 onClose={() => setDetailsAccount(null)}
             />
 
