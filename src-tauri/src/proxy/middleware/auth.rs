@@ -11,6 +11,50 @@ use tokio::sync::RwLock;
 
 use crate::proxy::{ProxyAuthMode, ProxySecurityConfig};
 
+fn extract_query_api_key<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    for pair in query.split('&') {
+        let mut iter = pair.splitn(2, '=');
+        let name = iter.next().unwrap_or_default();
+        if name == key {
+            return iter.next().or(Some(""));
+        }
+    }
+    None
+}
+
+fn extract_api_key<'a>(request: &'a Request) -> Option<&'a str> {
+    let header_key = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer ").or(Some(s)));
+
+    if header_key.is_some() {
+        return header_key;
+    }
+
+    let header_candidates = [
+        "x-api-key",
+        "api-key",
+        "x-goog-api-key",
+        "x-google-api-key",
+    ];
+    for header_name in header_candidates {
+        if let Some(value) = request
+            .headers()
+            .get(header_name)
+            .and_then(|h| h.to_str().ok())
+        {
+            return Some(value);
+        }
+    }
+
+    request
+        .uri()
+        .query()
+        .and_then(|query| extract_query_api_key(query, "key"))
+}
+
 /// API Key 认证中间件
 pub async fn auth_middleware(
     State(security): State<Arc<RwLock<ProxySecurityConfig>>>,
@@ -44,17 +88,7 @@ pub async fn auth_middleware(
     }
     
     // 从 header 中提取 API key
-    let api_key = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer ").or(Some(s)))
-        .or_else(|| {
-            request
-                .headers()
-                .get("x-api-key")
-                .and_then(|h| h.to_str().ok())
-        });
+    let api_key = extract_api_key(&request);
 
     if security.api_key.is_empty() {
         tracing::error!("Proxy auth is enabled but api_key is empty; denying request");
@@ -146,6 +180,44 @@ mod tests {
 
         assert_eq!(
             call(app, axum::http::Method::POST, "/v1/messages", vec![("x-api-key", key)]).await,
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            call(app.clone(), axum::http::Method::POST, "/v1/messages", vec![("api-key", key)]).await,
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            call(
+                app.clone(),
+                axum::http::Method::POST,
+                "/v1/messages",
+                vec![("x-goog-api-key", key)],
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            call(
+                app.clone(),
+                axum::http::Method::POST,
+                "/v1/messages",
+                vec![("x-google-api-key", key)],
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            call(
+                app,
+                axum::http::Method::POST,
+                "/v1/messages?key=sk-test",
+                vec![],
+            )
+            .await,
             StatusCode::OK
         );
     }

@@ -321,6 +321,16 @@ pub fn resolve_model_route_with_availability(
         if let Some(candidate) = availability.resolve_requested_model_with_min_percent(original_model, min_percent) {
             return candidate;
         }
+
+        if requested_best.is_none()
+            && availability.is_model_available_with_min_percent("gemini-3-flash", 0)
+        {
+            crate::modules::logger::log_warn(&format!(
+                "[Router] Requested model not in pool. Fallback to gemini-3-flash: {} -> gemini-3-flash",
+                original_model
+            ));
+            return "gemini-3-flash".to_string();
+        }
     }
 
     let lower_model = original_model.to_lowercase();
@@ -483,6 +493,7 @@ pub fn resolve_model_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn test_model_mapping() {
@@ -507,5 +518,31 @@ mod tests {
             map_claude_model_to_gemini("unknown-model"),
             "claude-sonnet-4-5"
         );
+    }
+
+    #[test]
+    fn test_fallback_to_gemini_flash_when_model_missing() {
+        let mut model_percentages = HashMap::new();
+        model_percentages.insert("gemini-3-flash".to_string(), 42);
+
+        let availability = ModelAvailability {
+            models: HashSet::new(),
+            model_percentages,
+            has_unknown_quota: false,
+            has_healthy_models: true,
+            has_healthy_thinking_models: false,
+        };
+
+        let resolved = resolve_model_route_with_availability(
+            "gemini-3-flash-preview",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            Some(&availability),
+            LOW_QUOTA_THRESHOLD_PERCENT,
+        );
+
+        assert_eq!(resolved, "gemini-3-flash");
     }
 }
