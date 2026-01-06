@@ -54,11 +54,31 @@ impl std::fmt::Display for TokenSelectionError {
 
 impl std::error::Error for TokenSelectionError {}
 
+#[derive(Debug, Clone)]
+struct QuotaSkipInfo {
+    account_id: String,
+    email: String,
+    percentage: Option<i32>,
+}
+
+impl QuotaSkipInfo {
+    fn new(token: &ProxyToken, percentage: Option<i32>) -> Self {
+        Self {
+            account_id: token.account_id.clone(),
+            email: token.email.clone(),
+            percentage,
+        }
+    }
+}
+
 struct ModelQuotaSnapshot {
     eligible: Vec<ProxyToken>,
     any_known: bool,
     any_positive: bool,
     any_above_min: bool,
+    zero_quota: Vec<QuotaSkipInfo>,
+    low_quota: Vec<QuotaSkipInfo>,
+    unknown_quota: Vec<QuotaSkipInfo>,
 }
 
 fn account_model_percentage(token: &ProxyToken, model: &str) -> Option<i32> {
@@ -83,6 +103,9 @@ fn build_model_quota_snapshot(
     let mut any_known = false;
     let mut any_positive = false;
     let mut any_above_min = false;
+    let mut zero_quota = Vec::new();
+    let mut low_quota = Vec::new();
+    let mut unknown_quota = Vec::new();
 
     for token in tokens {
         if token.quota_is_forbidden {
@@ -90,7 +113,10 @@ fn build_model_quota_snapshot(
         }
 
         match account_model_percentage(token, model) {
-            None => continue,
+            None => {
+                unknown_quota.push(QuotaSkipInfo::new(token, None));
+                continue;
+            }
             Some(percent) => {
                 any_known = true;
                 if percent > 0 {
@@ -99,6 +125,10 @@ fn build_model_quota_snapshot(
                 if percent > min_percent {
                     any_above_min = true;
                     eligible.push(token.clone());
+                } else if percent <= 0 {
+                    zero_quota.push(QuotaSkipInfo::new(token, Some(percent)));
+                } else {
+                    low_quota.push(QuotaSkipInfo::new(token, Some(percent)));
                 }
             }
         }
@@ -109,6 +139,9 @@ fn build_model_quota_snapshot(
         any_known,
         any_positive,
         any_above_min,
+        zero_quota,
+        low_quota,
+        unknown_quota,
     }
 }
 
@@ -384,6 +417,28 @@ impl TokenManager {
 
         if let Some(ref model) = requested_model {
             let snapshot = build_model_quota_snapshot(&tokens_snapshot, model, min_percent);
+            if snapshot.any_above_min && min_percent > 0 {
+                for info in &snapshot.low_quota {
+                    tracing::debug!(
+                        "Skipping account {} ({}): {}% <= {}% for model {}",
+                        info.account_id,
+                        info.email,
+                        info.percentage.unwrap_or(0),
+                        min_percent,
+                        model
+                    );
+                }
+            }
+            if snapshot.any_positive {
+                for info in &snapshot.zero_quota {
+                    tracing::debug!(
+                        "Skipping account {} ({}): 0% quota for model {}",
+                        info.account_id,
+                        info.email,
+                        model
+                    );
+                }
+            }
             if snapshot.eligible.is_empty() {
                 let reason = if !snapshot.any_known {
                     QuotaUnavailableReason::UnknownQuota
@@ -394,6 +449,28 @@ impl TokenManager {
                 } else {
                     QuotaUnavailableReason::LowQuota
                 };
+                match reason {
+                    QuotaUnavailableReason::UnknownQuota => {
+                        tracing::warn!(
+                            "All accounts have unknown quota for model {} (unknown_count: {}).",
+                            model,
+                            snapshot.unknown_quota.len()
+                        );
+                    }
+                    QuotaUnavailableReason::ZeroQuota => {
+                        tracing::warn!(
+                            "All accounts are at 0% quota for model {}.",
+                            model
+                        );
+                    }
+                    QuotaUnavailableReason::LowQuota => {
+                        tracing::warn!(
+                            "All accounts are at or below {}% quota for model {}.",
+                            min_percent,
+                            model
+                        );
+                    }
+                }
                 return Err(TokenSelectionError::ModelQuotaUnavailable {
                     model: model.clone(),
                     reason,

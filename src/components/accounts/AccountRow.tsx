@@ -1,4 +1,4 @@
-import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, Clock, ToggleLeft, ToggleRight } from 'lucide-react';
+import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, Clock, AlertCircle, ToggleLeft, ToggleRight } from 'lucide-react';
 import { Account } from '../../types/account';
 import { RateLimitStatus } from '../../types/rateLimit';
 import { getQuotaColor, formatTimeRemaining, getTimeRemainingColor, formatDurationSeconds, formatDate } from '../../utils/format';
@@ -30,6 +30,16 @@ function AccountRow({ account, rateLimit, selected, onSelect, isCurrent, isRefre
     const geminiImageModel = account.quota?.models.find(m => m.name.toLowerCase() === 'gemini-3-pro-image');
     const claudeModel = account.quota?.models.find(m => m.name.toLowerCase() === 'claude-sonnet-4-5-thinking');
     const isDisabled = Boolean(account.disabled);
+    const quotaUnknown = !account.quota?.is_forbidden && (!account.quota?.models || account.quota.models.length === 0);
+    const quotaUnknownReason = quotaUnknown
+        ? (account.quota_last_attempt_at ? t('accounts.quota_unknown_reason_recent') : t('accounts.quota_unknown_reason_initial'))
+        : '';
+    const quotaUnknownLastAttempt = quotaUnknown && account.quota_last_attempt_at
+        ? formatDate(account.quota_last_attempt_at)
+        : null;
+    const quotaUnknownTooltip = quotaUnknown
+        ? `${quotaUnknownReason}. ${t('accounts.quota_unknown_hint')}${quotaUnknownLastAttempt ? ` • ${t('accounts.quota_unknown_last_attempt')}: ${quotaUnknownLastAttempt}` : ''}`
+        : '';
     const rateLimitReason = rateLimit ? t(`accounts.rate_limit_reasons.${rateLimit.reason}`) : '';
     const rateLimitReset = rateLimit ? formatDate(rateLimit.reset_at) : null;
 
@@ -111,6 +121,16 @@ function AccountRow({ account, rateLimit, selected, onSelect, isCurrent, isRefre
                             <span className="px-2 py-0.5 rounded-md bg-red-100 dark:bg-red-900/50 text-red-600 dark:text-red-400 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-red-200/50" title={t('accounts.forbidden_tooltip')}>
                                 <Lock className="w-2.5 h-2.5" />
                                 <span>{t('accounts.forbidden')}</span>
+                            </span>
+                        )}
+
+                        {quotaUnknown && (
+                            <span
+                                className="px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-900/40 text-slate-600 dark:text-slate-300 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-slate-200/60"
+                                title={quotaUnknownTooltip}
+                            >
+                                <AlertCircle className="w-2.5 h-2.5" />
+                                <span>{t('accounts.quota_unknown_badge')}</span>
                             </span>
                         )}
 

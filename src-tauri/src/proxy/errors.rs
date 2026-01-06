@@ -5,6 +5,7 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
+use tracing::warn;
 
 pub(crate) fn truncate_utf8(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
@@ -36,6 +37,12 @@ pub fn anthropic_error(status: StatusCode, error_type: &'static str, message: im
 }
 
 fn sse_error_response(status: StatusCode, payload: Value) -> Response {
+    let payload_text = payload.to_string();
+    warn!(
+        "SSE error sent (status {}): {}",
+        status.as_u16(),
+        truncate_utf8(&payload_text, 400)
+    );
     let data = format!("event: error\ndata: {}\n\n", payload);
     Response::builder()
         .status(status)

@@ -284,14 +284,29 @@ pub fn resolve_model_route_with_availability(
     availability: Option<&ModelAvailability>,
     min_percent: i32,
 ) -> String {
+    let requested_best = availability.and_then(|a| a.best_percentage_for_model(original_model));
+
     let allow_target = |target: &str| {
         availability.map_or(true, |a| a.is_model_available_with_min_percent(target, min_percent))
+    };
+    let log_quota_fallback = |target: &str| {
+        if original_model == target {
+            return;
+        }
+        if matches!(requested_best, Some(0)) {
+            crate::modules::logger::log_warn(&format!(
+                "[Router] Fallback due to 0% quota for requested model: {} -> {}",
+                original_model,
+                target
+            ));
+        }
     };
 
     // 1. 检查自定义精确映射 (优先级最高)
     if let Some(target) = custom_mapping.get(original_model) {
         if allow_target(target) {
             crate::modules::logger::log_info(&format!("[Router] 使用自定义精确映射: {} -> {}", original_model, target));
+            log_quota_fallback(target);
             return target.clone();
         }
         crate::modules::logger::log_warn(&format!(
@@ -317,6 +332,7 @@ pub fn resolve_model_route_with_availability(
         if let Some(target) = openai_mapping.get("gpt-4-series") {
             if allow_target(target) {
                 crate::modules::logger::log_info(&format!("[Router] 使用 GPT-4 系列映射: {} -> {}", original_model, target));
+                log_quota_fallback(target);
                 return target.clone();
             }
         }
@@ -327,6 +343,7 @@ pub fn resolve_model_route_with_availability(
         if let Some(target) = openai_mapping.get("gpt-4o-series") {
             if allow_target(target) {
                 crate::modules::logger::log_info(&format!("[Router] 使用 GPT-4o/3.5 系列映射: {} -> {}", original_model, target));
+                log_quota_fallback(target);
                 return target.clone();
             }
         }
@@ -338,12 +355,14 @@ pub fn resolve_model_route_with_availability(
         if let Some(target) = openai_mapping.get("gpt-5-series") {
             if allow_target(target) {
                 crate::modules::logger::log_info(&format!("[Router] 使用 GPT-5 系列映射: {} -> {}", original_model, target));
+                log_quota_fallback(target);
                 return target.clone();
             }
         }
         if let Some(target) = openai_mapping.get("gpt-4-series") {
             if allow_target(target) {
                 crate::modules::logger::log_info(&format!("[Router] 使用 GPT-4 系列映射 (GPT-5 fallback): {} -> {}", original_model, target));
+                log_quota_fallback(target);
                 return target.clone();
             }
         }
@@ -383,6 +402,7 @@ pub fn resolve_model_route_with_availability(
                             original_model,
                             target
                         ));
+                        log_quota_fallback(target);
                         return target.clone();
                     }
                 }
@@ -400,6 +420,7 @@ pub fn resolve_model_route_with_availability(
                 "[Router] Haiku 智能降级 (CLI): {} -> gemini-2.5-flash-lite",
                 original_model
             ));
+            log_quota_fallback("gemini-2.5-flash-lite");
             return "gemini-2.5-flash-lite".to_string();
         }
 
@@ -414,6 +435,7 @@ pub fn resolve_model_route_with_availability(
         if let Some(target) = anthropic_mapping.get(family_key) {
             if allow_target(target) {
                 crate::modules::logger::log_warn(&format!("[Router] 使用 Anthropic 系列映射: {} -> {}", original_model, target));
+                log_quota_fallback(target);
                 return target.clone();
             }
         }
@@ -421,13 +443,16 @@ pub fn resolve_model_route_with_availability(
         // 兜底兼容旧版精确映射
         if let Some(target) = anthropic_mapping.get(original_model) {
             if allow_target(target) {
+                log_quota_fallback(target);
                 return target.clone();
             }
         }
     }
 
     // 5. 下沉到系统默认映射逻辑
-    map_claude_model_to_gemini(original_model)
+    let fallback = map_claude_model_to_gemini(original_model);
+    log_quota_fallback(&fallback);
+    fallback
 }
 
 /// 核心模型路由解析引擎

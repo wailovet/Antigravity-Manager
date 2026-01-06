@@ -14,6 +14,13 @@ interface AccountDetailsDialogProps {
 export default function AccountDetailsDialog({ account, rateLimit, onClose }: AccountDetailsDialogProps) {
     const { t } = useTranslation();
     if (!account) return null;
+    const quotaUnknown = !account.quota?.is_forbidden && (!account.quota?.models || account.quota.models.length === 0);
+    const quotaUnknownReason = quotaUnknown
+        ? (account.quota_last_attempt_at ? t('accounts.quota_unknown_reason_recent') : t('accounts.quota_unknown_reason_initial'))
+        : '';
+    const quotaUnknownLastAttempt = quotaUnknown && account.quota_last_attempt_at
+        ? formatDate(account.quota_last_attempt_at)
+        : null;
 
     return createPortal(
         <div className="modal modal-open z-[100]">
@@ -58,6 +65,27 @@ export default function AccountDetailsDialog({ account, rateLimit, onClose }: Ac
                                 <div>
                                     {t('accounts.rate_limit_reset')}: {formatDate(rateLimit.reset_at) || t('common.unknown')}
                                 </div>
+                            </div>
+                        </div>
+                    )}
+                    {quotaUnknown && (
+                        <div className="md:col-span-2 p-4 rounded-xl border border-slate-200 dark:border-slate-800/60 bg-slate-50/70 dark:bg-slate-900/30">
+                            <div className="flex items-center gap-2">
+                                <AlertCircle className="w-4 h-4 text-slate-500" />
+                                <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+                                    {t('accounts.quota_unknown_title')}
+                                </span>
+                                <span className="text-xs text-slate-500 dark:text-slate-300">
+                                    {quotaUnknownReason}
+                                </span>
+                            </div>
+                            <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs text-slate-600 dark:text-slate-300">
+                                <div>{t('accounts.quota_unknown_hint')}</div>
+                                {quotaUnknownLastAttempt && (
+                                    <div>
+                                        {t('accounts.quota_unknown_last_attempt')}: {quotaUnknownLastAttempt}
+                                    </div>
+                                )}
                             </div>
                         </div>
                     )}
