@@ -72,7 +72,18 @@ fn attach_attribution(
 
 // ===== Thinking 块处理辅助函数 =====
 
-use crate::proxy::mappers::claude::models::{ContentBlock, Message, MessageContent};
+use crate::proxy::mappers::claude::models::{ContentBlock, Message, MessageContent, SystemPrompt};
+
+const COMPACTION_LOG_SCAN_MESSAGES: usize = 8;
+const COMPACTION_LOG_KEYWORDS: [&str; 6] = [
+    "summarize",
+    "summarizing",
+    "summary",
+    "compaction",
+    "compact",
+    "text to summarize",
+];
+const TITLE_LOG_KEYWORDS: [&str; 3] = ["title generator", "thread title", "generate a brief title"];
 
 /// 检查 thinking 块是否有有效签名
 fn has_valid_signature(block: &ContentBlock) -> bool {
@@ -167,6 +178,38 @@ fn filter_invalid_thinking_blocks(messages: &mut Vec<Message>) {
     
     if total_filtered > 0 {
         debug!("Filtered {} invalid thinking block(s) from history", total_filtered);
+    }
+}
+
+fn system_prompt_text(system: &Option<SystemPrompt>) -> String {
+    match system {
+        None => String::new(),
+        Some(SystemPrompt::String(text)) => text.clone(),
+        Some(SystemPrompt::Array(blocks)) => blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn contains_keywords(text: &str, keywords: &[&str]) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let sample: String = text.chars().take(4096).collect();
+    let lower = sample.to_lowercase();
+    keywords.iter().any(|keyword| lower.contains(keyword))
+}
+
+fn message_contains_keywords(message: &Message, keywords: &[&str]) -> bool {
+    match &message.content {
+        MessageContent::String(text) => contains_keywords(text, keywords),
+        MessageContent::Array(blocks) => blocks.iter().any(|block| match block {
+            ContentBlock::Text { text } => contains_keywords(text, keywords),
+            ContentBlock::Thinking { thinking, .. } => contains_keywords(thinking, keywords),
+            _ => false,
+        }),
     }
 }
 
@@ -490,6 +533,36 @@ pub async fn handle_messages(
         request.messages.len(),
         request.tools.is_some()
     );
+
+    let system_text = system_prompt_text(&request.system);
+    let system_summary = contains_keywords(&system_text, &COMPACTION_LOG_KEYWORDS);
+    let system_title = contains_keywords(&system_text, &TITLE_LOG_KEYWORDS);
+    let mut user_summary_hint = false;
+    let mut assistant_summary_hint = false;
+    for msg in request.messages.iter().rev().take(COMPACTION_LOG_SCAN_MESSAGES) {
+        if !message_contains_keywords(msg, &COMPACTION_LOG_KEYWORDS) {
+            continue;
+        }
+        if msg.role == "assistant" {
+            assistant_summary_hint = true;
+        } else if msg.role == "user" {
+            user_summary_hint = true;
+        }
+    }
+    let post_compaction_hint = assistant_summary_hint && !system_summary && !system_title;
+    if system_summary || system_title || user_summary_hint || assistant_summary_hint {
+        info!(
+            "[{}][Compaction] Detected: system_summary={}, system_title={}, user_summary_hint={}, assistant_summary_hint={}, post_compaction_hint={}, scanned_messages={}, total_messages={}",
+            trace_id,
+            system_summary,
+            system_title,
+            user_summary_hint,
+            assistant_summary_hint,
+            post_compaction_hint,
+            COMPACTION_LOG_SCAN_MESSAGES,
+            request.messages.len()
+        );
+    }
     
     // DEBUG 级别: 详细的调试信息
     debug!("========== [{}] CLAUDE REQUEST DEBUG START ==========", trace_id);

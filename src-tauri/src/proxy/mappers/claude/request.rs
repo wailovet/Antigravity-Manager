@@ -70,6 +70,39 @@ fn clean_cache_control_from_messages(messages: &mut [Message]) {
     }
 }
 
+fn is_empty_message_content(msg: &Message) -> bool {
+    match &msg.content {
+        MessageContent::String(text) => {
+            let trimmed = text.trim();
+            trimmed.is_empty() || trimmed == "(no content)"
+        }
+        MessageContent::Array(blocks) => {
+            if blocks.is_empty() {
+                return true;
+            }
+            blocks.iter().all(|block| match block {
+                ContentBlock::Text { text } => {
+                    let trimmed = text.trim();
+                    trimmed.is_empty() || trimmed == "(no content)"
+                }
+                _ => false,
+            })
+        }
+    }
+}
+
+fn drop_empty_messages(messages: &mut Vec<Message>) {
+    let before = messages.len();
+    messages.retain(|msg| !is_empty_message_content(msg));
+    let dropped = before.saturating_sub(messages.len());
+    if dropped > 0 {
+        tracing::warn!(
+            "[Claude-Request] Dropped {} empty message(s) before transform",
+            dropped
+        );
+    }
+}
+
 /// 转换 Claude 请求为 Gemini v1internal 格式
 pub fn transform_claude_request_in(
     claude_req: &ClaudeRequest,
@@ -80,6 +113,7 @@ pub fn transform_claude_request_in(
     // 原封不动发回导致的 "Extra inputs are not permitted" 错误
     let mut cleaned_req = claude_req.clone();
     clean_cache_control_from_messages(&mut cleaned_req.messages);
+    drop_empty_messages(&mut cleaned_req.messages);
     let claude_req = &cleaned_req; // 后续使用清理后的请求
 
     // 检测是否有联网工具 (server tool or built-in tool)
@@ -592,6 +626,14 @@ fn build_contents(
         }
 
         if parts.is_empty() {
+            continue;
+        }
+
+        if parts.is_empty() {
+            tracing::warn!(
+                "[Claude-Request] Dropping message with empty content (role: {})",
+                role
+            );
             continue;
         }
 

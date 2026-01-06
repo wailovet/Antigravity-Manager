@@ -8,6 +8,8 @@ use std::sync::Arc;
 use crate::proxy::rate_limit::RateLimitTracker;
 use crate::proxy::sticky_config::StickySessionConfig;
 
+const LOW_QUOTA_THRESHOLD_PERCENT: i32 = 5;
+
 #[derive(Debug, Clone)]
 pub struct ProxyToken {
     pub account_id: String,
@@ -209,7 +211,9 @@ impl TokenManager {
         use crate::proxy::common::model_mapping::ModelAvailability;
 
         let mut models = HashSet::new();
+        let mut model_percentages: HashMap<String, i32> = HashMap::new();
         let mut has_unknown_quota = false;
+        let mut has_healthy_models = false;
 
         for token in self.tokens.iter() {
             let token = token.value();
@@ -220,8 +224,19 @@ impl TokenManager {
             match &token.quota_models {
                 Some(quota_models) => {
                     for (model, percentage) in quota_models {
+                        let entry = model_percentages
+                            .entry(model.clone())
+                            .or_insert(*percentage);
+                        if *percentage > *entry {
+                            *entry = *percentage;
+                        }
+
                         if *percentage > 0 {
                             models.insert(model.clone());
+                        }
+
+                        if *percentage > LOW_QUOTA_THRESHOLD_PERCENT {
+                            has_healthy_models = true;
                         }
                     }
                 }
@@ -233,7 +248,9 @@ impl TokenManager {
 
         ModelAvailability {
             models,
+            model_percentages,
             has_unknown_quota,
+            has_healthy_models,
         }
     }
     

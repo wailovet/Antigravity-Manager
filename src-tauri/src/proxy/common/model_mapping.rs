@@ -2,35 +2,79 @@
 use std::collections::{HashMap, HashSet};
 use once_cell::sync::Lazy;
 
+const LOW_QUOTA_THRESHOLD_PERCENT: i32 = 5;
+
 #[derive(Debug, Clone)]
 pub struct ModelAvailability {
     pub models: HashSet<String>,
+    pub model_percentages: HashMap<String, i32>,
     pub has_unknown_quota: bool,
+    pub has_healthy_models: bool,
 }
 
 impl ModelAvailability {
     pub fn resolve_requested_model(&self, model: &str) -> Option<String> {
-        for candidate in expand_model_candidates(model) {
-            if self.models.contains(&candidate) {
-                return Some(candidate);
-            }
+        let candidates = expand_model_candidates(model);
+        if candidates.is_empty() {
+            return None;
         }
 
         if self.has_unknown_quota && is_pool_model_name(model) {
             return Some(model.to_string());
         }
 
+        if self.has_any_healthy_models() {
+            for candidate in candidates {
+                if self.is_candidate_healthy(&candidate) {
+                    return Some(candidate);
+                }
+            }
+            return None;
+        }
+
+        for candidate in candidates {
+            if self.models.contains(&candidate) {
+                return Some(candidate);
+            }
+        }
+
         None
     }
 
     pub fn is_model_available(&self, model: &str) -> bool {
-        expand_model_candidates(model)
+        if self.has_unknown_quota {
+            return true;
+        }
+
+        let candidates = expand_model_candidates(model);
+        if candidates.is_empty() {
+            return false;
+        }
+
+        if self.has_any_healthy_models() {
+            return candidates
+                .iter()
+                .any(|candidate| self.is_candidate_healthy(candidate));
+        }
+
+        candidates
             .iter()
             .any(|candidate| self.models.contains(candidate))
     }
 
     pub fn can_use_original(&self, model: &str) -> bool {
         self.resolve_requested_model(model).is_some()
+    }
+
+    fn has_any_healthy_models(&self) -> bool {
+        self.has_healthy_models
+    }
+
+    fn is_candidate_healthy(&self, model: &str) -> bool {
+        match self.model_percentages.get(model) {
+            Some(percent) => *percent > LOW_QUOTA_THRESHOLD_PERCENT,
+            None => false,
+        }
     }
 }
 
@@ -248,8 +292,15 @@ pub fn resolve_model_route_with_availability(
 
     // 1. 检查自定义精确映射 (优先级最高)
     if let Some(target) = custom_mapping.get(original_model) {
-        crate::modules::logger::log_info(&format!("[Router] 使用自定义精确映射: {} -> {}", original_model, target));
-        return target.clone();
+        if allow_target(target) {
+            crate::modules::logger::log_info(&format!("[Router] 使用自定义精确映射: {} -> {}", original_model, target));
+            return target.clone();
+        }
+        crate::modules::logger::log_warn(&format!(
+            "[Router] 自定义映射跳过(配额偏低): {} -> {}",
+            original_model,
+            target
+        ));
     }
 
     // 2. 如果目标模型可用，优先使用原始模型
