@@ -1022,23 +1022,9 @@ fn build_generation_config(
         config["topK"] = json!(top_k);
     }
 
-    // Effort level mapping (Claude API v2.0.67+)
-    // Maps Claude's output_config.effort to Gemini's effortLevel
-    if let Some(output_config) = &claude_req.output_config {
-        if let Some(effort) = &output_config.effort {
-            config["effortLevel"] = json!(match effort.to_lowercase().as_str() {
-                "high" => "HIGH",
-                "medium" => "MEDIUM",
-                "low" => "LOW",
-                _ => "HIGH" // Default to HIGH for unknown values
-            });
-            tracing::debug!(
-                "[Generation-Config] Effort level set: {} -> {}",
-                effort,
-                config["effortLevel"]
-            );
-        }
-    }
+    // NOTE: Do not map Claude "effort" to Gemini generationConfig.
+    // Some clients (e.g. OpenCode) may send `output_config.effort`, but Gemini rejects
+    // unknown fields like `effortLevel` with INVALID_ARGUMENT.
 
     // web_search 强制 candidateCount=1
     /*if has_web_search {
