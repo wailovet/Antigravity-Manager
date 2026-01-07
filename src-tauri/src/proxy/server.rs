@@ -33,6 +33,7 @@ pub struct AppState {
     pub monitor: Arc<crate::proxy::monitor::ProxyMonitor>,
     pub access_log_enabled: Arc<RwLock<bool>>,
     pub response_attribution_headers: Arc<RwLock<bool>>,
+    pub experimental: Arc<RwLock<crate::proxy::config::ExperimentalConfig>>,
 }
 
 /// Axum 服务器实例
@@ -46,6 +47,7 @@ pub struct AxumServer {
     zai_state: Arc<RwLock<crate::proxy::ZaiConfig>>,
     access_log_enabled_state: Arc<RwLock<bool>>,
     response_attribution_headers_state: Arc<RwLock<bool>>,
+    experimental_state: Arc<RwLock<crate::proxy::config::ExperimentalConfig>>,
 }
 
 impl AxumServer {
@@ -89,6 +91,11 @@ impl AxumServer {
         *self.response_attribution_headers_state.write().await = config.response_attribution_headers;
         tracing::info!("反代服务可观测性配置已热更新");
     }
+
+    pub async fn update_experimental(&self, config: &crate::proxy::config::ProxyConfig) {
+        *self.experimental_state.write().await = config.experimental.clone();
+        tracing::info!("反代服务 experimental 配置已热更新");
+    }
     /// 启动 Axum 服务器
     pub async fn start(
         host: String,
@@ -104,6 +111,7 @@ impl AxumServer {
         monitor: Arc<crate::proxy::monitor::ProxyMonitor>,
         access_log_enabled: bool,
         response_attribution_headers: bool,
+        experimental_config: crate::proxy::config::ExperimentalConfig,
 
     ) -> Result<(Self, tokio::task::JoinHandle<()>), String> {
         let mapping_state = Arc::new(tokio::sync::RwLock::new(anthropic_mapping));
@@ -117,6 +125,7 @@ impl AxumServer {
             let response_attribution_headers_state = Arc::new(RwLock::new(response_attribution_headers));
 	        let zai_vision_mcp_state =
 	            Arc::new(crate::proxy::zai_vision_mcp::ZaiVisionMcpState::new());
+	        let experimental_state = Arc::new(RwLock::new(experimental_config));
 
 	        let state = AppState {
 	            token_manager: token_manager.clone(),
@@ -137,6 +146,7 @@ impl AxumServer {
             monitor: monitor.clone(),
             access_log_enabled: access_log_enabled_state.clone(),
             response_attribution_headers: response_attribution_headers_state.clone(),
+	            experimental: experimental_state.clone(),
 	        };
 
 
@@ -163,6 +173,10 @@ impl AxumServer {
                 "/v1/images/edits",
                 post(handlers::openai::handle_images_edits),
             ) // 图像编辑 API
+            .route(
+                "/v1/audio/transcriptions",
+                post(handlers::audio::handle_audio_transcription),
+            ) // 音频转录 API (PR #311)
             // Claude Protocol
             .route("/v1/messages", post(handlers::claude::handle_messages))
             .route(
@@ -241,6 +255,7 @@ impl AxumServer {
 	            zai_state,
                 access_log_enabled_state,
                 response_attribution_headers_state,
+                experimental_state,
 	        };
 
         // 在新任务中启动服务器

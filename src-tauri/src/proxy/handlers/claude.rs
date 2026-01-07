@@ -14,6 +14,7 @@ use tracing::{debug, error, info};
 
 use crate::proxy::mappers::claude::{
     transform_claude_request_in, transform_response, create_claude_sse_stream, ClaudeRequest,
+    close_tool_loop_for_thinking,
 };
 use crate::proxy::server::AppState;
 use axum::http::HeaderMap;
@@ -69,6 +70,15 @@ fn attach_attribution(
         account_email_masked,
     });
 }
+
+// ===== Model Constants for Background Tasks =====
+// These can be adjusted for performance/cost optimization
+const BACKGROUND_MODEL_LITE: &str = "gemini-2.5-flash-lite";  // For simple/lightweight tasks
+const BACKGROUND_MODEL_STANDARD: &str = "gemini-2.5-flash";   // For complex background tasks
+
+// ===== Jitter Configuration (REMOVED) =====
+// Jitter was causing connection instability, reverted to fixed delays
+// const JITTER_FACTOR: f64 = 0.2;
 
 // ===== Thinking 块处理辅助函数 =====
 
@@ -243,6 +253,9 @@ fn remove_trailing_unsigned_thinking(blocks: &mut Vec<ContentBlock>) {
 
 // ===== 统一退避策略模块 =====
 
+// [REMOVED] apply_jitter function
+// Jitter logic removed to restore stability (v3.3.16 fix)
+
 /// 重试策略枚举
 #[derive(Debug, Clone)]
 enum RetryStrategy {
@@ -322,43 +335,44 @@ async fn apply_retry_strategy(
         }
 
         RetryStrategy::FixedDelay(duration) => {
+            let base_ms = duration.as_millis() as u64;
             info!(
-                "[{}] ⏱️  Retry with fixed delay: status={}, attempt={}/{}, waiting={}ms",
+                "[{}] ⏱️  Retry with fixed delay: status={}, attempt={}/{}, base={}ms",
                 trace_id,
                 status_code,
                 attempt + 1,
                 MAX_RETRY_ATTEMPTS,
-                duration.as_millis()
+                base_ms
             );
             sleep(duration).await;
             true
         }
 
         RetryStrategy::LinearBackoff { base_ms } => {
-            let delay_ms = base_ms * (attempt as u64 + 1);
+            let calculated_ms = base_ms * (attempt as u64 + 1);
             info!(
-                "[{}] ⏱️  Retry with linear backoff: status={}, attempt={}/{}, waiting={}ms",
+                "[{}] ⏱️  Retry with linear backoff: status={}, attempt={}/{}, base={}ms",
                 trace_id,
                 status_code,
                 attempt + 1,
                 MAX_RETRY_ATTEMPTS,
-                delay_ms
+                calculated_ms
             );
-            sleep(Duration::from_millis(delay_ms)).await;
+            sleep(Duration::from_millis(calculated_ms)).await;
             true
         }
 
         RetryStrategy::ExponentialBackoff { base_ms, max_ms } => {
-            let delay_ms = (base_ms * 2_u64.pow(attempt as u32)).min(max_ms);
+            let calculated_ms = (base_ms * 2_u64.pow(attempt as u32)).min(max_ms);
             info!(
-                "[{}] ⏱️  Retry with exponential backoff: status={}, attempt={}/{}, waiting={}ms",
+                "[{}] ⏱️  Retry with exponential backoff: status={}, attempt={}/{}, base={}ms",
                 trace_id,
                 status_code,
                 attempt + 1,
                 MAX_RETRY_ATTEMPTS,
-                delay_ms
+                calculated_ms
             );
-            sleep(Duration::from_millis(delay_ms)).await;
+            sleep(Duration::from_millis(calculated_ms)).await;
             true
         }
     }
@@ -387,10 +401,7 @@ pub async fn handle_messages(
     Json(body): Json<Value>,
 ) -> Response {
     if state.monitor.is_enabled() {
-        tracing::info!(
-            ">>> [RED ALERT] handle_messages called! Body JSON len: {}",
-            body.to_string().len()
-        );
+        tracing::debug!("handle_messages called. Body JSON len: {}", body.to_string().len());
     }
     
     // 生成随机 Trace ID 用户追踪
@@ -441,6 +452,12 @@ pub async fn handle_messages(
 
     // [CRITICAL FIX] 过滤并修复 Thinking 块签名
     filter_invalid_thinking_blocks(&mut request.messages);
+
+    // [New] Recover from broken tool loops (where signatures were stripped)
+    // This prevents "Assistant message must start with thinking" errors by closing the loop with synthetic messages
+    if state.experimental.read().await.enable_tool_loop_recovery {
+        close_tool_loop_for_thinking(&mut request.messages);
+    }
 
     if use_zai {
         // Preserve unknown top-level fields (OpenCode payloads) while replacing messages with sanitized blocks.
@@ -885,7 +902,7 @@ pub async fn handle_messages(
             if request.stream {
                 let stream = response.bytes_stream();
                 let gemini_stream = Box::pin(stream);
-	                let claude_stream = create_claude_sse_stream(gemini_stream, trace_id, email.clone());
+                let claude_stream = create_claude_sse_stream(gemini_stream, trace_id, email.clone());
 
                 // 转换为 Bytes stream
                 let sse_stream = claude_stream.map(|result| -> Result<Bytes, std::io::Error> {
@@ -895,16 +912,21 @@ pub async fn handle_messages(
                     }
                 });
 
-	                let mut resp = Response::builder()
-	                    .status(StatusCode::OK)
-	                    .header(header::CONTENT_TYPE, "text/event-stream")
-	                    .header(header::CACHE_CONTROL, "no-cache")
-	                    .header(header::CONNECTION, "keep-alive")
-	                    .body(Body::from_stream(sse_stream))
-	                    .unwrap();
-                    attach_attribution(&mut resp, "google", Some(request_with_mapped.model.clone()), Some(&email));
-                    return resp;
-	            } else {
+                let mut resp = Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header(header::CONNECTION, "keep-alive")
+                    .body(Body::from_stream(sse_stream))
+                    .unwrap();
+                attach_attribution(
+                    &mut resp,
+                    "google",
+                    Some(request_with_mapped.model.clone()),
+                    Some(&email),
+                );
+                return resp;
+            } else {
                 // 处理非流式响应
                 let bytes = match response.bytes().await {
                     Ok(b) => b,
@@ -952,11 +974,16 @@ pub async fn handle_messages(
                     cache_info
                 );
 
-	                let mut resp = Json(claude_response).into_response();
-                    attach_attribution(&mut resp, "google", Some(request_with_mapped.model.clone()), Some(&email));
-	                return resp;
-	            }
-	        }
+                let mut resp = Json(claude_response).into_response();
+                attach_attribution(
+                    &mut resp,
+                    "google",
+                    Some(request_with_mapped.model.clone()),
+                    Some(&email),
+                );
+                return resp;
+            }
+        }
         
         // 1. 立即提取状态码和 headers（防止 response 被 move）
         let status_code = status.as_u16();
@@ -980,7 +1007,11 @@ pub async fn handle_messages(
                 || error_text.contains("thinking.signature: Field required")
                 || error_text.contains("thinking.thinking: Field required")
                 || error_text.contains("thinking.signature")
-                || error_text.contains("thinking.thinking"))
+                || error_text.contains("thinking.thinking")
+                || error_text.contains("INVALID_ARGUMENT")  // [New] Catch generic Google 400s
+                || error_text.contains("Corrupted thought signature") // [New] Explicit signature corruption
+                || error_text.contains("failed to deserialise") // [New] JSON structure issues
+                )
         {
             retried_without_thinking = true;
             
@@ -1258,11 +1289,11 @@ fn extract_last_user_message_for_detection(request: &ClaudeRequest) -> Option<St
 /// 根据后台任务类型选择合适的模型
 fn select_background_model(task_type: BackgroundTaskType) -> &'static str {
     match task_type {
-        BackgroundTaskType::TitleGeneration => "gemini-2.5-flash-lite",  // 极简任务
-        BackgroundTaskType::SimpleSummary => "gemini-2.5-flash-lite",    // 简单摘要
-        BackgroundTaskType::SystemMessage => "gemini-2.5-flash-lite",    // 系统消息
-        BackgroundTaskType::PromptSuggestion => "gemini-2.5-flash-lite", // 建议生成
-        BackgroundTaskType::EnvironmentProbe => "gemini-2.5-flash-lite", // 环境探测
-        BackgroundTaskType::ContextCompression => "gemini-2.5-flash",   // 复杂压缩
+        BackgroundTaskType::TitleGeneration => BACKGROUND_MODEL_LITE,     // 极简任务
+        BackgroundTaskType::SimpleSummary => BACKGROUND_MODEL_LITE,       // 简单摘要
+        BackgroundTaskType::SystemMessage => BACKGROUND_MODEL_LITE,       // 系统消息
+        BackgroundTaskType::PromptSuggestion => BACKGROUND_MODEL_LITE,    // 建议生成
+        BackgroundTaskType::EnvironmentProbe => BACKGROUND_MODEL_LITE,    // 环境探测
+        BackgroundTaskType::ContextCompression => BACKGROUND_MODEL_STANDARD, // 复杂压缩
     }
 }

@@ -25,6 +25,8 @@ pub mod session_manager;   // 会话指纹管理
 pub mod zai_auth;          // z.ai token normalization
 pub mod zai_web_tools;     // z.ai web tools helpers (URL normalization)
 pub mod errors;            // error payload helpers
+pub mod audio;             // 音频处理模块 (PR #311)
+pub mod signature_cache;   // Signature Cache (v3.3.16)
 
 
 pub use config::ProxyConfig;
@@ -34,3 +36,7 @@ pub use config::ZaiDispatchMode;
 pub use token_manager::TokenManager;
 pub use server::AxumServer;
 pub use security::ProxySecurityConfig;
+pub use signature_cache::SignatureCache;
+
+#[cfg(test)]
+pub mod tests;

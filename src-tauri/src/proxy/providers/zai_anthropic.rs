@@ -95,7 +95,10 @@ fn build_client(
         }
     }
 
-    builder.build().map_err(|e| format!("Failed to build HTTP client: {}", e))
+    builder
+        .tcp_nodelay(true) // [FIX #307] Disable Nagle's algorithm to improve latency for small requests
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))
 }
 
 fn copy_passthrough_headers(incoming: &HeaderMap) -> HeaderMap {
@@ -137,6 +140,25 @@ fn set_zai_auth(headers: &mut HeaderMap, incoming: &HeaderMap, api_key: &str) {
         if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", api_key)) {
             headers.insert(header::AUTHORIZATION, v);
         }
+    }
+}
+
+/// Recursively remove cache_control from all nested objects/arrays
+/// [FIX #290] This is a defensive fix that works regardless of serde annotations
+pub fn deep_remove_cache_control(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("cache_control");
+            for v in map.values_mut() {
+                deep_remove_cache_control(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                deep_remove_cache_control(v);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -183,7 +205,20 @@ pub async fn forward_anthropic_json(
         .entry(header::CONTENT_TYPE)
         .or_insert(HeaderValue::from_static("application/json"));
 
-    let req = client.request(method, &url).headers(headers).json(&body);
+    // [FIX #290] Clean cache_control before sending to Anthropic API
+    // This prevents "Extra inputs are not permitted" errors
+    deep_remove_cache_control(&mut body);
+
+    // [FIX #307] Explicitly serialize body to Vec<u8> to ensure Content-Length is set correctly.
+    // This avoids "Transfer-Encoding: chunked" for small bodies which caused connection errors.
+    let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
+    let body_len = body_bytes.len();
+    
+    tracing::debug!("Forwarding request to z.ai (len: {} bytes): {}", body_len, url);
+
+    let req = client.request(method, &url)
+        .headers(headers)
+        .body(body_bytes); // Use .body(Vec<u8>) instead of .json()
 
     let resp = match req.send().await {
         Ok(r) => r,

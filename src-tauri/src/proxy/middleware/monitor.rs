@@ -11,6 +11,9 @@ use crate::proxy::observability::RequestAttribution;
 use serde_json::Value;
 use futures::StreamExt;
 
+const MAX_REQUEST_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB
+const MAX_RESPONSE_LOG_SIZE: usize = 10 * 1024 * 1024; // 10MB for image responses
+
 pub async fn monitor_middleware(
     State(state): State<AppState>,
     request: Request,
@@ -40,7 +43,7 @@ pub async fn monitor_middleware(
     let request_body_str;
     let request = if method == "POST" {
         let (parts, body) = request.into_parts();
-        match axum::body::to_bytes(body, 1024 * 1024).await {
+        match axum::body::to_bytes(body, MAX_REQUEST_LOG_SIZE).await {
             Ok(bytes) => {
                 if model.is_none() {
                     model = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v|
@@ -75,6 +78,20 @@ pub async fn monitor_middleware(
         .unwrap_or("")
         .to_string();
 
+    // Extract account email from X-Account-Email header if present
+    let account_email = response
+        .headers()
+        .get("X-Account-Email")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Extract mapped model from X-Mapped-Model header if present
+    let mapped_model = response
+        .headers()
+        .get("X-Mapped-Model")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     let monitor = state.monitor.clone();
     let mut log = ProxyRequestLog {
         id: uuid::Uuid::new_v4().to_string(),
@@ -83,7 +100,9 @@ pub async fn monitor_middleware(
         url: uri,
         status,
         duration,
-        model, 
+        model,
+        mapped_model,
+        account_email,
         provider: None,
         resolved_model: None,
         account_id: None,
@@ -153,7 +172,7 @@ pub async fn monitor_middleware(
         Response::from_parts(parts, Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
     } else if content_type.contains("application/json") || content_type.contains("text/") {
         let (parts, body) = response.into_parts();
-        match axum::body::to_bytes(body, 512 * 1024).await {
+        match axum::body::to_bytes(body, MAX_RESPONSE_LOG_SIZE).await {
             Ok(bytes) => {
                 if let Ok(s) = std::str::from_utf8(&bytes) {
                     if let Ok(json) = serde_json::from_str::<Value>(&s) {
@@ -177,7 +196,7 @@ pub async fn monitor_middleware(
                 Response::from_parts(parts, Body::from(bytes))
             }
             Err(_) => {
-                log.response_body = Some("[Response too large]".to_string());
+                log.response_body = Some("[Response too large (>10MB)]".to_string());
                 monitor.log_request(log).await;
                 Response::from_parts(parts, Body::empty())
             }

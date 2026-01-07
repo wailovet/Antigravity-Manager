@@ -29,6 +29,9 @@ pub struct ClaudeRequest {
     pub thinking: Option<ThinkingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
+    /// Output configuration for effort level (Claude API v2.0.67+)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
 }
 
 /// Thinking 配置
@@ -100,6 +103,11 @@ pub enum ContentBlock {
         cache_control: Option<serde_json::Value>,
     },
 
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking {
+        data: String,
+    },
+
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -131,9 +139,6 @@ pub enum ContentBlock {
         tool_use_id: String,
         content: serde_json::Value,
     },
-
-    #[serde(rename = "redacted_thinking")]
-    RedactedThinking { data: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +212,15 @@ impl Tool {
 pub struct Metadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
+}
+
+/// Output Configuration (Claude API v2.0.67+)
+/// Controls effort level for model reasoning
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputConfig {
+    /// Effort level: "high", "medium", "low"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 /// Claude API 响应

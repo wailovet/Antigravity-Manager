@@ -39,6 +39,8 @@ pub fn init_db() -> Result<(), String> {
     let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN resolved_model TEXT", []);
     let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN account_id TEXT", []);
     let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN account_email_masked TEXT", []);
+    let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN account_email TEXT", []);
+    let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN mapped_model TEXT", []);
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_timestamp ON request_logs (timestamp DESC)",
@@ -57,8 +59,16 @@ pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
     }
 
     conn.execute(
-        "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, provider, resolved_model, account_id, account_email_masked, error, request_body, response_body, input_tokens, output_tokens)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        "INSERT INTO request_logs (
+            id, timestamp, method, url, status, duration, model, mapped_model,
+            provider, resolved_model, account_id, account_email, account_email_masked,
+            error, request_body, response_body, input_tokens, output_tokens
+         )
+         VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+            ?9, ?10, ?11, ?12, ?13,
+            ?14, ?15, ?16, ?17, ?18
+         )",
         params![
             log.id,
             log.timestamp,
@@ -67,9 +77,11 @@ pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
             log.status,
             log.duration,
             log.model,
+            log.mapped_model,
             log.provider,
             log.resolved_model,
             log.account_id,
+            log.account_email,
             log.account_email_masked,
             log.error,
             log.request_body,
@@ -109,9 +121,12 @@ pub fn get_logs(limit: usize) -> Result<Vec<ProxyRequestLog>, String> {
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
 
     let mut stmt = conn.prepare(
-        "SELECT id, timestamp, method, url, status, duration, model, provider, resolved_model, account_id, account_email_masked, error, request_body, response_body, input_tokens, output_tokens
-         FROM request_logs 
-         ORDER BY timestamp DESC 
+        "SELECT
+            id, timestamp, method, url, status, duration, model, mapped_model,
+            provider, resolved_model, account_id, account_email, account_email_masked,
+            error, request_body, response_body, input_tokens, output_tokens
+         FROM request_logs
+         ORDER BY timestamp DESC
          LIMIT ?1"
     ).map_err(|e| e.to_string())?;
 
@@ -124,15 +139,17 @@ pub fn get_logs(limit: usize) -> Result<Vec<ProxyRequestLog>, String> {
             status: row.get(4)?,
             duration: row.get(5)?,
             model: row.get(6)?,
-            provider: row.get(7).unwrap_or(None),
-            resolved_model: row.get(8).unwrap_or(None),
-            account_id: row.get(9).unwrap_or(None),
-            account_email_masked: row.get(10).unwrap_or(None),
-            error: row.get(11)?,
-            request_body: row.get(12).unwrap_or(None),
-            response_body: row.get(13).unwrap_or(None),
-            input_tokens: row.get(14).unwrap_or(None),
-            output_tokens: row.get(15).unwrap_or(None),
+            mapped_model: row.get(7).unwrap_or(None),
+            provider: row.get(8).unwrap_or(None),
+            resolved_model: row.get(9).unwrap_or(None),
+            account_id: row.get(10).unwrap_or(None),
+            account_email: row.get(11).unwrap_or(None),
+            account_email_masked: row.get(12).unwrap_or(None),
+            error: row.get(13)?,
+            request_body: row.get(14).unwrap_or(None),
+            response_body: row.get(15).unwrap_or(None),
+            input_tokens: row.get(16).unwrap_or(None),
+            output_tokens: row.get(17).unwrap_or(None),
         })
     }).map_err(|e| e.to_string())?;
 

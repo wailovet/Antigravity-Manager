@@ -191,6 +191,7 @@ pub async fn start_proxy_service(
             monitor.clone(),
             config.access_log_enabled,
             config.response_attribution_headers,
+            config.experimental.clone(),
 
         ).await {
             Ok((server, handle)) => (server, handle),

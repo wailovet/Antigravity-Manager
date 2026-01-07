@@ -3,9 +3,108 @@
 
 use super::models::*;
 use super::utils::to_claude_usage;
-use crate::proxy::mappers::signature_store::store_thought_signature;
+// use crate::proxy::mappers::signature_store::store_thought_signature; // Deprecated
+use crate::proxy::SignatureCache;
 use bytes::Bytes;
 use serde_json::json;
+
+/// Known parameter remappings for Gemini → Claude compatibility
+/// [FIX] Gemini sometimes uses different parameter names than specified in tool schema
+fn remap_function_call_args(tool_name: &str, args: &mut serde_json::Value) {
+    // [DEBUG] Always log incoming tool usage for diagnosis
+    if let Some(obj) = args.as_object() {
+        tracing::debug!("[Streaming] Tool Call: '{}' Args: {:?}", tool_name, obj);
+    }
+
+    if let Some(obj) = args.as_object_mut() {
+        // [IMPROVED] Case-insensitive matching for tool names
+        match tool_name.to_lowercase().as_str() {
+            "grep" => {
+                // Gemini uses "query", Claude Code expects "pattern"
+                if let Some(query) = obj.remove("query") {
+                    if !obj.contains_key("pattern") {
+                        obj.insert("pattern".to_string(), query);
+                        tracing::debug!("[Streaming] Remapped Grep: query → pattern");
+                    }
+                }
+                
+                // [CRITICAL FIX] Claude Code uses "path" (string), NOT "paths" (array)!
+                if !obj.contains_key("path") {
+                    // Check if Gemini sent "paths" (array) - convert to string
+                    if let Some(paths) = obj.remove("paths") {
+                        let path_str = if let Some(arr) = paths.as_array() {
+                            // Take first element if array
+                            arr.get(0)
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(".")
+                                .to_string()
+                        } else if let Some(s) = paths.as_str() {
+                            // Already a string
+                            s.to_string()
+                        } else {
+                            ".".to_string()
+                        };
+                        obj.insert("path".to_string(), serde_json::json!(path_str));
+                        tracing::debug!("[Streaming] Remapped Grep: paths → path(\"{}\")", path_str);
+                    } else {
+                        // No path provided at all - default to current directory
+                        obj.insert("path".to_string(), serde_json::json!("."));
+                        tracing::debug!("[Streaming] Remapped Grep: default path → \".\"");
+                    }
+                }
+            }
+            "glob" => {
+                // Gemini uses "query", Claude Code expects "pattern"
+                if let Some(query) = obj.remove("query") {
+                    if !obj.contains_key("pattern") {
+                        obj.insert("pattern".to_string(), query);
+                        tracing::debug!("[Streaming] Remapped Glob: query → pattern");
+                    }
+                }
+                
+                // [CRITICAL FIX] Claude Code uses "path" (string), NOT "paths" (array)!
+                if !obj.contains_key("path") {
+                    if let Some(paths) = obj.remove("paths") {
+                        let path_str = if let Some(arr) = paths.as_array() {
+                            arr.get(0)
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(".")
+                                .to_string()
+                        } else if let Some(s) = paths.as_str() {
+                            s.to_string()
+                        } else {
+                            ".".to_string()
+                        };
+                        obj.insert("path".to_string(), serde_json::json!(path_str));
+                        tracing::debug!("[Streaming] Remapped Glob: paths → path(\"{}\")", path_str);
+                    } else {
+                        obj.insert("path".to_string(), serde_json::json!("."));
+                        tracing::debug!("[Streaming] Remapped Glob: default path → \".\"");
+                    }
+                }
+            }
+            "read" => {
+                // Gemini might use "path" vs "file_path"
+                if let Some(path) = obj.remove("path") {
+                    if !obj.contains_key("file_path") {
+                        obj.insert("file_path".to_string(), path);
+                        tracing::debug!("[Streaming] Remapped Read: path → file_path");
+                    }
+                }
+            }
+            "ls" => {
+                 // LS tool: ensure "path" parameter exists
+                 if !obj.contains_key("path") {
+                     obj.insert("path".to_string(), json!("."));
+                     tracing::debug!("[Streaming] Remapped LS: default path → \".\"");
+                 }
+            }
+            other => {
+                 tracing::debug!("[Streaming] Unmapped tool call: {} (args: {:?})", other, obj.keys());
+            }
+        }
+    }
+}
 
 /// 块类型枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +154,8 @@ pub struct StreamingState {
     // [IMPROVED] Error recovery 状态追踪
     parse_error_count: usize,
     last_valid_state: Option<BlockType>,
+    // [NEW] Model tracking for signature cache
+    pub model_name: Option<String>,
 }
 
 impl StreamingState {
@@ -72,6 +173,7 @@ impl StreamingState {
             // [IMPROVED] 初始化 error recovery 字段
             parse_error_count: 0,
             last_valid_state: None,
+            model_name: None,
         }
     }
 
@@ -109,6 +211,11 @@ impl StreamingState {
             "stop_reason": null,
             "stop_sequence": null,
         });
+
+        // Capture model name for signature cache
+        if let Some(m) = raw_json.get("modelVersion").and_then(|v| v.as_str()) {
+            self.model_name = Some(m.to_string());
+        }
 
         if let Some(u) = usage {
             message["usage"] = json!(u);
@@ -375,12 +482,22 @@ impl StreamingState {
             tracing::debug!("[SSE-Parser] Failed chunk preview: {}", preview);
         }
 
-        // 错误率过高时发出警告
+        // 错误率过高时发出警告并尝试发送错误信号
         if self.parse_error_count > 5 {
             tracing::error!(
                 "[SSE-Parser] High error rate detected ({} errors). Stream may be corrupted.",
                 self.parse_error_count
             );
+            
+            // [FIX] Explicitly signal error to client to prevent UI freeze
+            // Using "overloaded_error" type to suggest retry
+            chunks.push(self.emit("error", json!({
+                "type": "error",
+                "error": {
+                    "type": "overloaded_error",
+                    "message": "Stream connection unstable (too many parse errors). Please retry."
+                }
+            })));
         }
 
         chunks
@@ -510,7 +627,20 @@ impl<'a> PartProcessor<'a> {
             );
         }
 
-        // 暂存签名
+        // [IMPROVED] Store signature to global cache
+        if let Some(ref sig) = signature {
+            // 1. Cache family if we know the model
+            if let Some(model) = &self.state.model_name {
+                 SignatureCache::global().cache_thinking_family(sig.clone(), model.clone());
+            }
+            
+            tracing::debug!(
+                "[Claude-SSE] Captured thought_signature from thinking block (length: {})",
+                sig.len()
+            );
+        }
+
+        // 暂存签名 (for local block handling)
         self.state.store_signature(signature);
 
         chunks
@@ -625,9 +755,11 @@ impl<'a> PartProcessor<'a> {
 
         if let Some(ref sig) = signature {
             tool_use["signature"] = json!(sig);
-            // Store signature to global storage for replay in subsequent requests
-            store_thought_signature(sig);
-            tracing::info!(
+            
+            // 2. Cache tool signature (Layer 1 recovery)
+            SignatureCache::global().cache_tool_signature(&tool_id, sig.clone());
+            
+             tracing::debug!(
                 "[Claude-SSE] Captured thought_signature for function call (length: {})",
                 sig.len()
             );
@@ -636,8 +768,12 @@ impl<'a> PartProcessor<'a> {
         chunks.extend(self.state.start_block(BlockType::Function, tool_use));
 
         // 2. 发送 input_json_delta (完整的参数 JSON 字符串)
+        // [FIX] Remap args before serialization for Gemini → Claude compatibility
         if let Some(args) = &fc.args {
-            let json_str = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
+            let mut remapped_args = args.clone();
+            remap_function_call_args(&fc.name, &mut remapped_args);
+            let json_str =
+                serde_json::to_string(&remapped_args).unwrap_or_else(|_| "{}".to_string());
             chunks.push(
                 self.state
                     .emit_delta("input_json_delta", json!({ "partial_json": json_str })),

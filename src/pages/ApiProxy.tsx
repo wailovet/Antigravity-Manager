@@ -24,9 +24,10 @@ import {
     Layers,
     Activity
 } from 'lucide-react';
-import { AppConfig, ProxyConfig } from '../types/config';
+import { AppConfig, ProxyConfig, StickySessionConfig } from '../types/config';
 import HelpTooltip from '../components/common/HelpTooltip';
 import Switch from '../components/common/Switch';
+import { cn } from '../utils/cn';
 
 interface ProxyStatus {
     running: boolean;
@@ -127,9 +128,9 @@ function CollapsibleCard({
     const { t } = useTranslation();
 
     return (
-        <div className="bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-base-200 overflow-hidden transition-all duration-200 hover:shadow-md">
+        <div className="bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-gray-700/50 overflow-hidden transition-all duration-200 hover:shadow-md">
             <div
-                className="px-5 py-4 flex items-center justify-between cursor-pointer bg-gray-50/50 dark:bg-base-200/30 hover:bg-gray-50 dark:hover:bg-base-200/50 transition-colors"
+                className="px-5 py-4 flex items-center justify-between cursor-pointer bg-gray-50/50 dark:bg-gray-800/50 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors"
                 onClick={(e) => {
                     // Prevent toggle when clicking the switch or right element
                     if ((e.target as HTMLElement).closest('.no-expand')) return;
@@ -144,7 +145,7 @@ function CollapsibleCard({
                         {title}
                     </span>
                     {enabled !== undefined && (
-                        <div className={`text-xs px-2 py-0.5 rounded-full ${enabled ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400' : 'bg-gray-100 text-gray-500 dark:bg-gray-700 dark:text-gray-400'}`}>
+                        <div className={cn('text-xs px-2 py-0.5 rounded-full', enabled ? 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400' : 'bg-gray-100 text-gray-500 dark:bg-gray-600/50 dark:text-gray-300')}>
                             {enabled ? t('common.enabled') : t('common.disabled')}
                         </div>
                     )}
@@ -160,7 +161,7 @@ function CollapsibleCard({
                     )}
 
                     <button
-                        className={`p-1 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-all duration-200 ${isExpanded ? 'rotate-180' : ''}`}
+                        className={cn('p-1 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-all duration-200', isExpanded ? 'rotate-180' : '')}
                     >
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                             <path d="m6 9 6 6 6-6" />
@@ -176,9 +177,9 @@ function CollapsibleCard({
                 <div className="p-5 relative">
                     {/* Overlay when disabled */}
                     {enabled === false && (
-                        <div className="absolute inset-0 bg-white/60 dark:bg-base-100/60 z-10 cursor-not-allowed" />
+                        <div className="absolute inset-0 bg-gray-100/40 dark:bg-black/30 z-10 cursor-not-allowed" />
                     )}
-                    <div className={enabled === false ? 'opacity-50 pointer-events-none select-none filter blur-[0.5px]' : ''}>
+                    <div className={enabled === false ? 'opacity-60 pointer-events-none select-none' : ''}>
                         {children}
                     </div>
                 </div>
@@ -445,6 +446,31 @@ export default function ApiProxy() {
             }
         };
         saveConfig(newConfig);
+    };
+
+    const updateSchedulingConfig = (updates: Partial<StickySessionConfig>) => {
+        if (!appConfig) return;
+        const currentScheduling = appConfig.proxy.scheduling || { mode: 'Balance', max_wait_seconds: 60 };
+        const newScheduling = { ...currentScheduling, ...updates };
+
+        const newConfig = {
+            ...appConfig,
+            proxy: {
+                ...appConfig.proxy,
+                scheduling: newScheduling
+            }
+        };
+        saveConfig(newConfig);
+    };
+
+    const handleClearSessionBindings = async () => {
+        if (!confirm(t('proxy.dialog.clear_bindings_msg'))) return;
+        try {
+            await invoke('clear_proxy_session_bindings');
+        } catch (error) {
+            console.error('Failed to clear session bindings:', error);
+            alert(`${t('common.error')}: ${error}`);
+        }
     };
 
     const refreshZaiModels = async () => {
@@ -1558,7 +1584,7 @@ print(response.text)`;
                                     <div className="flex gap-2 text-[10px] text-gray-400">
                                         {['web_search', 'web_reader', 'zread', 'vision'].map(f =>
                                             appConfig.proxy.zai?.mcp?.[(f + '_enabled') as keyof typeof appConfig.proxy.zai.mcp] && (
-                                                <span key={f} className="bg-gray-100 dark:bg-base-200 px-1.5 py-0.5 rounded text-gray-600 dark:text-gray-400">
+                                                <span key={f} className="bg-blue-500 dark:bg-blue-600 px-1.5 py-0.5 rounded text-white font-semibold shadow-sm">
                                                     {t(`proxy.config.zai.mcp.${f}`).split(' ')[0]}
                                                 </span>
                                             )
@@ -1601,7 +1627,7 @@ print(response.text)`;
                                         <label className="flex items-center gap-2 border border-gray-100 dark:border-base-200 p-2 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-base-200/50 transition-colors">
                                             <input
                                                 type="checkbox"
-                                                className="checkbox checkbox-xs checkbox-primary rounded-md"
+                                                className="checkbox checkbox-xs rounded border-2 border-gray-400 dark:border-gray-500 checked:border-blue-600 checked:bg-blue-600 [--chkbg:theme(colors.blue.600)] [--chkfg:white]"
                                                 checked={!!appConfig.proxy.zai?.mcp?.web_search_enabled}
                                                 onChange={(e) => updateZaiGeneralConfig({ mcp: { ...(appConfig.proxy.zai?.mcp || {}), web_search_enabled: e.target.checked } as any })}
                                             />
@@ -1610,7 +1636,7 @@ print(response.text)`;
                                         <label className="flex items-center gap-2 border border-gray-100 dark:border-base-200 p-2 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-base-200/50 transition-colors">
                                             <input
                                                 type="checkbox"
-                                                className="checkbox checkbox-xs checkbox-primary rounded-md"
+                                                className="checkbox checkbox-xs rounded border-2 border-gray-400 dark:border-gray-500 checked:border-blue-600 checked:bg-blue-600 [--chkbg:theme(colors.blue.600)] [--chkfg:white]"
                                                 checked={!!appConfig.proxy.zai?.mcp?.web_reader_enabled}
                                                 onChange={(e) => updateZaiGeneralConfig({ mcp: { ...(appConfig.proxy.zai?.mcp || {}), web_reader_enabled: e.target.checked } as any })}
                                             />
@@ -1619,7 +1645,7 @@ print(response.text)`;
                                         <label className="flex items-center gap-2 border border-gray-100 dark:border-base-200 p-2 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-base-200/50 transition-colors">
                                             <input
                                                 type="checkbox"
-                                                className="checkbox checkbox-xs checkbox-primary rounded-md"
+                                                className="checkbox checkbox-xs rounded border-2 border-gray-400 dark:border-gray-500 checked:border-blue-600 checked:bg-blue-600 [--chkbg:theme(colors.blue.600)] [--chkfg:white]"
                                                 checked={!!appConfig.proxy.zai?.mcp?.zread_enabled}
                                                 onChange={(e) => updateZaiGeneralConfig({ mcp: { ...(appConfig.proxy.zai?.mcp || {}), zread_enabled: e.target.checked } as any })}
                                             />
@@ -1628,7 +1654,7 @@ print(response.text)`;
                                         <label className="flex items-center gap-2 border border-gray-100 dark:border-base-200 p-2 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-base-200/50 transition-colors">
                                             <input
                                                 type="checkbox"
-                                                className="checkbox checkbox-xs checkbox-primary rounded-md"
+                                                className="checkbox checkbox-xs rounded border-2 border-gray-400 dark:border-gray-500 checked:border-blue-600 checked:bg-blue-600 [--chkbg:theme(colors.blue.600)] [--chkfg:white]"
                                                 checked={!!appConfig.proxy.zai?.mcp?.vision_enabled}
                                                 onChange={(e) => updateZaiGeneralConfig({ mcp: { ...(appConfig.proxy.zai?.mcp || {}), vision_enabled: e.target.checked } as any })}
                                             />
@@ -1679,7 +1705,7 @@ print(response.text)`;
                                             appConfig.proxy.zai?.mcp?.web_reader_enabled ||
                                             appConfig.proxy.zai?.mcp?.zread_enabled ||
                                             appConfig.proxy.zai?.mcp?.vision_enabled)) && (
-                                        <div className="bg-gray-50 dark:bg-base-200/50 rounded-lg p-3 text-[10px] font-mono text-gray-500">
+                                        <div className="bg-slate-100 dark:bg-slate-800/80 rounded-lg p-3 text-[10px] font-mono text-slate-600 dark:text-slate-400">
                                             <div className="mb-1 font-bold text-gray-400 uppercase tracking-wider">
                                                 {t('proxy.config.zai.mcp.local_endpoints')}
                                             </div>
@@ -1717,6 +1743,99 @@ print(response.text)`;
                                     )}
                                 </div>
                             </CollapsibleCard>
+
+                            {/* Account Scheduling & Rotation */}
+                            <CollapsibleCard
+                                title={t('proxy.config.scheduling.title')}
+                                icon={<RefreshCw size={18} className="text-indigo-500" />}
+                            >
+                                <div className="space-y-4">
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                        <div className="space-y-3">
+                                            <div className="flex items-center justify-between">
+                                                <label className="text-xs font-medium text-gray-700 dark:text-gray-300 inline-flex items-center gap-1">
+                                                    {t('proxy.config.scheduling.mode')}
+                                                    <HelpTooltip
+                                                        text={t('proxy.config.scheduling.mode_tooltip')}
+                                                        placement="right"
+                                                    />
+                                                </label>
+                                                <button
+                                                    onClick={handleClearSessionBindings}
+                                                    className="text-[10px] text-indigo-500 hover:text-indigo-600 transition-colors flex items-center gap-1"
+                                                >
+                                                    <Trash2 size={12} />
+                                                    {t('proxy.config.scheduling.clear_bindings')}
+                                                </button>
+                                            </div>
+                                            <div className="grid grid-cols-1 gap-2">
+                                                {(['CacheFirst', 'Balance', 'PerformanceFirst'] as const).map(mode => (
+                                                    <label
+                                                        key={mode}
+                                                        className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-all duration-200 ${(appConfig.proxy.scheduling?.mode || 'Balance') === mode
+                                                            ? 'border-indigo-500 bg-indigo-50/30 dark:bg-indigo-900/10'
+                                                            : 'border-gray-100 dark:border-base-200 hover:border-indigo-200'
+                                                            }`}
+                                                    >
+                                                        <input
+                                                            type="radio"
+                                                            className="radio radio-xs radio-primary mt-1"
+                                                            checked={(appConfig.proxy.scheduling?.mode || 'Balance') === mode}
+                                                            onChange={() => updateSchedulingConfig({ mode })}
+                                                        />
+                                                        <div className="space-y-1">
+                                                            <div className="text-xs font-bold text-gray-900 dark:text-base-content">
+                                                                {t(`proxy.config.scheduling.modes.${mode}`)}
+                                                            </div>
+                                                            <div className="text-[10px] text-gray-500 line-clamp-2">
+                                                                {t(`proxy.config.scheduling.modes_desc.${mode}`, {
+                                                                    defaultValue: mode === 'CacheFirst' ? 'Binds session to account, waits precisely if limited (Maximizes Prompt Cache hits).' :
+                                                                        mode === 'Balance' ? 'Binds session, auto-switches to available account if limited (Balanced cache & availability).' :
+                                                                            'No session binding, pure round-robin rotation (Best for high concurrency).'
+                                                                })}
+                                                            </div>
+                                                        </div>
+                                                    </label>
+                                                ))}
+                                            </div>
+                                        </div>
+
+                                        <div className="space-y-4 pt-1">
+                                            <div className="bg-slate-100 dark:bg-slate-800/80 rounded-xl p-4 border border-slate-200 dark:border-slate-700">
+                                                <div className="flex items-center justify-between mb-2">
+                                                    <label className="text-xs font-medium text-gray-700 dark:text-gray-300 inline-flex items-center gap-1">
+                                                        {t('proxy.config.scheduling.max_wait')}
+                                                        <HelpTooltip text={t('proxy.config.scheduling.max_wait_tooltip')} />
+                                                    </label>
+                                                    <span className="text-xs font-mono text-indigo-600 font-bold">
+                                                        {appConfig.proxy.scheduling?.max_wait_seconds || 60}s
+                                                    </span>
+                                                </div>
+                                                <input
+                                                    type="range"
+                                                    min="0"
+                                                    max="300"
+                                                    step="10"
+                                                    disabled={(appConfig.proxy.scheduling?.mode || 'Balance') !== 'CacheFirst'}
+                                                    className="range range-indigo range-xs"
+                                                    value={appConfig.proxy.scheduling?.max_wait_seconds || 60}
+                                                    onChange={(e) => updateSchedulingConfig({ max_wait_seconds: parseInt(e.target.value) })}
+                                                />
+                                                <div className="flex justify-between px-1 mt-1 text-[10px] text-gray-400 font-mono">
+                                                    <span>0s</span>
+                                                    <span>300s</span>
+                                                </div>
+                                            </div>
+
+                                            <div className="p-3 bg-amber-50 dark:bg-amber-900/10 border border-amber-100 dark:border-amber-900/20 rounded-xl">
+                                                <p className="text-[10px] text-amber-700 dark:text-amber-500 leading-relaxed">
+                                                    <strong>{t('common.info')}:</strong> {t('proxy.config.scheduling.subtitle')}
+                                                </p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </CollapsibleCard>
                         </div>
                     )
                 }
@@ -1725,7 +1844,7 @@ print(response.text)`;
                 {
                     appConfig && (
                         <div className="bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-base-200 overflow-hidden">
-                            <div className="px-4 py-2.5 border-b border-gray-100 dark:border-base-200 bg-gray-50/50 dark:bg-base-200/50">
+                            <div className="px-4 py-2.5 border-b border-gray-100 dark:border-gray-700/50 bg-gray-50/50 dark:bg-gray-800/50">
                                 <div className="flex items-center justify-between">
                                     <div>
                                         <h2 className="text-base font-bold flex items-center gap-2 text-gray-900 dark:text-base-content">
@@ -2326,7 +2445,7 @@ print(response.text)`;
                                 <div className="col-span-2 p-0">
                                     <div className="overflow-x-auto">
                                         <table className="table w-full">
-                                            <thead className="bg-gray-50/50 dark:bg-base-200/50 text-gray-500 dark:text-gray-400">
+                                            <thead className="bg-gray-50/50 dark:bg-gray-800/50 text-gray-500 dark:text-gray-400">
                                                 <tr>
                                                     <th className="w-10 pl-3"></th>
                                                     <th className="text-[11px] font-medium">{t('proxy.supported_models.model_name')}</th>

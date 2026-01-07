@@ -4,6 +4,100 @@
 use super::models::*;
 use super::utils::to_claude_usage;
 
+/// Known parameter remappings for Gemini → Claude compatibility
+/// [FIX] Gemini sometimes uses different parameter names than specified in tool schema
+fn remap_function_call_args(tool_name: &str, args: &mut serde_json::Value) {
+    // [DEBUG] Always log incoming tool usage for diagnosis
+    if let Some(obj) = args.as_object() {
+        tracing::debug!("[Response] Tool Call: '{}' Args: {:?}", tool_name, obj);
+    }
+
+    if let Some(obj) = args.as_object_mut() {
+        // [IMPROVED] Case-insensitive matching for tool names
+        match tool_name.to_lowercase().as_str() {
+            "grep" => {
+                // Gemini uses "query", Claude Code expects "pattern"
+                if let Some(query) = obj.remove("query") {
+                    if !obj.contains_key("pattern") {
+                        obj.insert("pattern".to_string(), query);
+                        tracing::debug!("[Response] Remapped Grep: query → pattern");
+                    }
+                }
+                
+                // [CRITICAL FIX] Claude Code uses "path" (string), NOT "paths" (array)!
+                if !obj.contains_key("path") {
+                    if let Some(paths) = obj.remove("paths") {
+                        let path_str = if let Some(arr) = paths.as_array() {
+                            arr.get(0)
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(".")
+                                .to_string()
+                        } else if let Some(s) = paths.as_str() {
+                            s.to_string()
+                        } else {
+                            ".".to_string()
+                        };
+                        obj.insert("path".to_string(), serde_json::json!(path_str));
+                        tracing::debug!("[Response] Remapped Grep: paths → path(\"{}\")", path_str);
+                    } else {
+                        obj.insert("path".to_string(), serde_json::json!("."));
+                        tracing::debug!("[Response] Remapped Grep: default path → \".\"");
+                    }
+                }
+            }
+            "glob" => {
+                // Gemini uses "query", Claude Code expects "pattern"
+                if let Some(query) = obj.remove("query") {
+                    if !obj.contains_key("pattern") {
+                        obj.insert("pattern".to_string(), query);
+                        tracing::debug!("[Response] Remapped Glob: query → pattern");
+                    }
+                }
+                
+                // [CRITICAL FIX] Claude Code uses "path" (string), NOT "paths" (array)!
+                if !obj.contains_key("path") {
+                    if let Some(paths) = obj.remove("paths") {
+                        let path_str = if let Some(arr) = paths.as_array() {
+                            arr.get(0)
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(".")
+                                .to_string()
+                        } else if let Some(s) = paths.as_str() {
+                            s.to_string()
+                        } else {
+                            ".".to_string()
+                        };
+                        obj.insert("path".to_string(), serde_json::json!(path_str));
+                        tracing::debug!("[Response] Remapped Glob: paths → path(\"{}\")", path_str);
+                    } else {
+                        obj.insert("path".to_string(), serde_json::json!("."));
+                        tracing::debug!("[Response] Remapped Glob: default path → \".\"");
+                    }
+                }
+            }
+            "read" => {
+                // Gemini might use "path" vs "file_path"
+                if let Some(path) = obj.remove("path") {
+                    if !obj.contains_key("file_path") {
+                        obj.insert("file_path".to_string(), path);
+                        tracing::debug!("[Response] Remapped Read: path → file_path");
+                    }
+                }
+            }
+            "ls" => {
+                 // LS tool: ensure "path" parameter exists
+                 if !obj.contains_key("path") {
+                     obj.insert("path".to_string(), serde_json::json!("."));
+                     tracing::debug!("[Response] Remapped LS: default path → \".\"");
+                 }
+            }
+            other => {
+                 tracing::debug!("[Response] Unmapped tool call: {} (args: {:?})", other, obj.keys());
+            }
+        }
+    }
+}
+
 /// 非流式响应处理器
 pub struct NonStreamingProcessor {
     content_blocks: Vec<ContentBlock>,
@@ -96,10 +190,14 @@ impl NonStreamingProcessor {
                 )
             });
 
+            // [FIX] Remap args for Gemini → Claude compatibility
+            let mut args = fc.args.clone().unwrap_or(serde_json::json!({}));
+            remap_function_call_args(&fc.name, &mut args);
+
             let mut tool_use = ContentBlock::ToolUse {
                 id: tool_id,
                 name: fc.name.clone(),
-                input: fc.args.clone().unwrap_or(serde_json::json!({})),
+                input: args,
                 signature: None,
                 cache_control: None,
             };

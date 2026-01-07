@@ -13,12 +13,16 @@ pub struct ProxyRequestLog {
     pub status: u16,
     pub duration: u64, // ms
     pub model: Option<String>,
+    /// 实际路由后使用的模型名（当可用）。
+    pub mapped_model: Option<String>,
     /// Best-effort attribution (when available).
     pub provider: Option<String>,
     /// Best-effort resolved upstream model id (when available).
     pub resolved_model: Option<String>,
     /// Best-effort anonymized account id (when available).
     pub account_id: Option<String>,
+    /// Best-effort full account email (when available).
+    pub account_email: Option<String>,
     /// Best-effort masked account email (when available).
     pub account_email_masked: Option<String>,
     pub error: Option<String>,
