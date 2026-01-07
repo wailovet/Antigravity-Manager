@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::proxy::rate_limit::{RateLimitInfo, RateLimitTracker};
+use crate::proxy::rate_limit::{RateLimitInfo, RateLimitKey, RateLimitTracker};
 use crate::proxy::sticky_config::StickySessionConfig;
 
 #[derive(Debug, Clone)]
@@ -519,7 +519,9 @@ impl TokenManager {
                         self.session_accounts.remove(sid);
                     } else {
                     // 2. 检查绑定的账号是否限流 (使用精准的剩余时间接口)
-                    let reset_sec = self.rate_limit_tracker.get_remaining_wait(&bound_id);
+                    let reset_sec = self
+                        .rate_limit_tracker
+                        .get_remaining_wait(&bound_id, requested_model.as_deref());
                     if reset_sec > 0 {
                         if scheduling.mode == SchedulingMode::CacheFirst && reset_sec <= scheduling.max_wait_seconds {
                             // 缓存优先模式：限流时间短，执行精准精准避让等待
@@ -590,7 +592,7 @@ impl TokenManager {
                         }
 
                         // 【新增】主动避开限流或 5xx 锁定的账号 (来自 PR #28 的高可用思路)
-                        if self.is_rate_limited(&candidate.account_id) {
+                        if self.is_rate_limited(&candidate.account_id, requested_model.as_deref()) {
                             continue;
                         }
 
@@ -618,7 +620,7 @@ impl TokenManager {
                     }
 
                     // 【新增】主动避开限流或 5xx 锁定的账号
-                    if self.is_rate_limited(&candidate.account_id) {
+                    if self.is_rate_limited(&candidate.account_id, requested_model.as_deref()) {
                         continue;
                     }
 
@@ -635,8 +637,12 @@ impl TokenManager {
                 Some(t) => t,
                 None => {
                     // 如果所有账号都被尝试过或都处于限流中，计算最短等待时间
-                    let min_wait = tokens_snapshot.iter()
-                        .filter_map(|t| self.rate_limit_tracker.get_reset_seconds(&t.account_id))
+                    let min_wait = tokens_snapshot
+                        .iter()
+                        .filter_map(|t| {
+                            self.rate_limit_tracker
+                                .get_reset_seconds(&t.account_id, requested_model.as_deref())
+                        })
                         .min()
                         .unwrap_or(60);
                     
@@ -825,12 +831,14 @@ impl TokenManager {
     pub fn mark_rate_limited(
         &self,
         account_id: &str,
+        model: &str,
         status: u16,
         retry_after_header: Option<&str>,
         error_body: &str,
     ) {
         self.rate_limit_tracker.parse_from_error(
             account_id,
+            model,
             status,
             retry_after_header,
             error_body,
@@ -838,14 +846,14 @@ impl TokenManager {
     }
     
     /// 检查账号是否在限流中
-    pub fn is_rate_limited(&self, account_id: &str) -> bool {
-        self.rate_limit_tracker.is_rate_limited(account_id)
+    pub fn is_rate_limited(&self, account_id: &str, model: Option<&str>) -> bool {
+        self.rate_limit_tracker.is_rate_limited(account_id, model)
     }
     
     /// 获取距离限流重置还有多少秒
     #[allow(dead_code)]
-    pub fn get_rate_limit_reset_seconds(&self, account_id: &str) -> Option<u64> {
-        self.rate_limit_tracker.get_reset_seconds(account_id)
+    pub fn get_rate_limit_reset_seconds(&self, account_id: &str, model: Option<&str>) -> Option<u64> {
+        self.rate_limit_tracker.get_reset_seconds(account_id, model)
     }
     
     /// 清除过期的限流记录
@@ -857,11 +865,11 @@ impl TokenManager {
     /// 清除指定账号的限流记录
     #[allow(dead_code)]
     pub fn clear_rate_limit(&self, account_id: &str) -> bool {
-        self.rate_limit_tracker.clear(account_id)
+        self.rate_limit_tracker.clear_account(account_id) > 0
     }
 
     /// 获取当前限流记录快照
-    pub fn get_rate_limit_snapshot(&self) -> Vec<(String, RateLimitInfo)> {
+    pub fn get_rate_limit_snapshot(&self) -> Vec<(RateLimitKey, RateLimitInfo)> {
         self.rate_limit_tracker.cleanup_expired();
         self.rate_limit_tracker.snapshot()
     }

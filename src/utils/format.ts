@@ -112,3 +112,16 @@ export function formatDurationSeconds(totalSeconds: number): string {
     }
     return `${remainingSeconds}s`;
 }
+
+export function formatRateLimitModels(primary: string | undefined, models?: string[]): string | null {
+    if (models && models.length > 0) {
+        const unique = Array.from(new Set(models));
+        const base = primary && unique.includes(primary) ? primary : unique[0];
+        const extra = unique.filter((m) => m !== base);
+        if (extra.length > 0) {
+            return `${base} (+${extra.length})`;
+        }
+        return base;
+    }
+    return primary ?? null;
+}

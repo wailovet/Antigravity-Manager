@@ -260,7 +260,7 @@ pub async fn handle_generate(
         // 只有 429 (限流), 529 (过载), 503, 403 (权限) 和 401 (认证失效) 触发账号轮换
         if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 || status_code == 403 || status_code == 401 {
             // 记录限流信息 (全局同步)
-            token_manager.mark_rate_limited(&account_id, status_code, retry_after.as_deref(), &error_text);
+            token_manager.mark_rate_limited(&account_id, &mapped_model, status_code, retry_after.as_deref(), &error_text);
 
             // 只有明确包含 "QUOTA_EXHAUSTED" 才停止，避免误判上游的频率限制提示 (如 "check quota")
             if status_code == 429 && error_text.contains("QUOTA_EXHAUSTED") {

@@ -92,6 +92,7 @@
         "quota_unknown_last_attempt": "Last attempt",
         "rate_limit_badge": "Cooldown {{time}}",
         "rate_limit_reason": "Reason",
+        "rate_limit_model": "Model",
         "rate_limit_reset": "Reset at",
         "rate_limit_active": "Rate limited",
         "rate_limit_reasons": {

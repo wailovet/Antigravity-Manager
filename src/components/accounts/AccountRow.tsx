@@ -1,7 +1,7 @@
 import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, Clock, AlertCircle, ToggleLeft, ToggleRight } from 'lucide-react';
 import { Account } from '../../types/account';
 import { RateLimitStatus } from '../../types/rateLimit';
-import { getQuotaColor, formatTimeRemaining, getTimeRemainingColor, formatDurationSeconds, formatDate } from '../../utils/format';
+import { getQuotaColor, formatTimeRemaining, getTimeRemainingColor, formatDurationSeconds, formatDate, formatRateLimitModels } from '../../utils/format';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
 
@@ -42,6 +42,7 @@ function AccountRow({ account, rateLimit, selected, onSelect, isCurrent, isRefre
         : '';
     const rateLimitReason = rateLimit ? t(`accounts.rate_limit_reasons.${rateLimit.reason}`) : '';
     const rateLimitReset = rateLimit ? formatDate(rateLimit.reset_at) : null;
+    const rateLimitModel = rateLimit ? formatRateLimitModels(rateLimit.model, rateLimit.models) : null;
 
     // 颜色映射，避免动态类名被 Tailwind purge
     const getColorClass = (percentage: number) => {
@@ -137,7 +138,7 @@ function AccountRow({ account, rateLimit, selected, onSelect, isCurrent, isRefre
                         {rateLimit && (
                             <span
                                 className="px-2 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-amber-200/50"
-                                title={`${t('accounts.rate_limit_reason')}: ${rateLimitReason}${rateLimitReset ? ` • ${t('accounts.rate_limit_reset')}: ${rateLimitReset}` : ''}`}
+                                title={`${t('accounts.rate_limit_reason')}: ${rateLimitReason}${rateLimitModel ? ` • ${t('accounts.rate_limit_model')}: ${rateLimitModel}` : ''}${rateLimitReset ? ` • ${t('accounts.rate_limit_reset')}: ${rateLimitReset}` : ''}`}
                             >
                                 <Clock className="w-2.5 h-2.5" />
                                 <span>{t('accounts.rate_limit_badge', { time: formatDurationSeconds(rateLimit.remaining_seconds) })}</span>

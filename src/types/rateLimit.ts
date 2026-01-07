@@ -2,6 +2,8 @@ export type RateLimitReason = 'quota_exhausted' | 'rate_limit_exceeded' | 'serve
 
 export interface RateLimitStatus {
     account_id: string;
+    model: string;
+    models?: string[];
     reason: RateLimitReason;
     reset_at: number;
     remaining_seconds: number;

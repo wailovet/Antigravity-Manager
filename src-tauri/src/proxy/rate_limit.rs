@@ -30,9 +30,24 @@ pub struct RateLimitInfo {
     pub reason: RateLimitReason,
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct RateLimitKey {
+    pub account_id: String,
+    pub model: String,
+}
+
+impl RateLimitKey {
+    fn new(account_id: &str, model: &str) -> Self {
+        Self {
+            account_id: account_id.to_string(),
+            model: model.to_string(),
+        }
+    }
+}
+
 /// 限流跟踪器
 pub struct RateLimitTracker {
-    limits: DashMap<String, RateLimitInfo>,
+    limits: DashMap<RateLimitKey, RateLimitInfo>,
 }
 
 impl RateLimitTracker {
@@ -43,8 +58,12 @@ impl RateLimitTracker {
     }
     
     /// 获取账号剩余的等待时间(秒)
-    pub fn get_remaining_wait(&self, account_id: &str) -> u64 {
-        if let Some(info) = self.limits.get(account_id) {
+    pub fn get_remaining_wait(&self, account_id: &str, model: Option<&str>) -> u64 {
+        let model = match model {
+            Some(model) => model,
+            None => return 0,
+        };
+        if let Some(info) = self.limits.get(&RateLimitKey::new(account_id, model)) {
             let now = SystemTime::now();
             if info.reset_time > now {
                 let dur = info
@@ -72,6 +91,7 @@ impl RateLimitTracker {
     pub fn parse_from_error(
         &self,
         account_id: &str,
+        model: &str,
         status: u16,
         retry_after_header: Option<&str>,
         body: &str,
@@ -142,12 +162,13 @@ impl RateLimitTracker {
         };
         
         // 存储
-        self.limits.insert(account_id.to_string(), info.clone());
+        self.limits.insert(RateLimitKey::new(account_id, model), info.clone());
         
         tracing::warn!(
-            "账号 {} [{}] 限流类型: {:?}, 重置延时: {}秒",
+            "账号 {} [{}] 模型 {} 限流类型: {:?}, 重置延时: {}秒",
             account_id,
             status,
+            model,
             reason,
             retry_sec
         );
@@ -318,7 +339,7 @@ impl RateLimitTracker {
     }
 
     /// 获取限流记录快照
-    pub fn snapshot(&self) -> Vec<(String, RateLimitInfo)> {
+    pub fn snapshot(&self) -> Vec<(RateLimitKey, RateLimitInfo)> {
         self.limits
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().clone()))
@@ -326,13 +347,17 @@ impl RateLimitTracker {
     }
     
     /// 获取账号的限流信息
-    pub fn get(&self, account_id: &str) -> Option<RateLimitInfo> {
-        self.limits.get(account_id).map(|r| r.clone())
+    pub fn get(&self, account_id: &str, model: &str) -> Option<RateLimitInfo> {
+        self.limits.get(&RateLimitKey::new(account_id, model)).map(|r| r.clone())
     }
     
     /// 检查账号是否仍在限流中
-    pub fn is_rate_limited(&self, account_id: &str) -> bool {
-        if let Some(info) = self.get(account_id) {
+    pub fn is_rate_limited(&self, account_id: &str, model: Option<&str>) -> bool {
+        let model = match model {
+            Some(model) => model,
+            None => return false,
+        };
+        if let Some(info) = self.get(account_id, model) {
             info.reset_time > SystemTime::now()
         } else {
             false
@@ -340,8 +365,12 @@ impl RateLimitTracker {
     }
     
     /// 获取距离限流重置还有多少秒
-    pub fn get_reset_seconds(&self, account_id: &str) -> Option<u64> {
-        if let Some(info) = self.get(account_id) {
+    pub fn get_reset_seconds(&self, account_id: &str, model: Option<&str>) -> Option<u64> {
+        let model = match model {
+            Some(model) => model,
+            None => return None,
+        };
+        if let Some(info) = self.get(account_id, model) {
             info.reset_time
                 .duration_since(SystemTime::now())
                 .ok()
@@ -375,8 +404,26 @@ impl RateLimitTracker {
     
     /// 清除指定账号的限流记录
     #[allow(dead_code)]
-    pub fn clear(&self, account_id: &str) -> bool {
-        self.limits.remove(account_id).is_some()
+    pub fn clear(&self, account_id: &str, model: &str) -> bool {
+        self.limits.remove(&RateLimitKey::new(account_id, model)).is_some()
+    }
+
+    /// 清除指定账号的全部限流记录
+    #[allow(dead_code)]
+    pub fn clear_account(&self, account_id: &str) -> usize {
+        let mut count = 0;
+        self.limits.retain(|k, _| {
+            if k.account_id == account_id {
+                count += 1;
+                false
+            } else {
+                true
+            }
+        });
+        if count > 0 {
+            tracing::debug!("清除了账号 {} 的 {} 条限流记录", account_id, count);
+        }
+        count
     }
     
     /// 清除所有限流记录
@@ -431,8 +478,8 @@ mod tests {
     #[test]
     fn test_get_remaining_wait() {
         let tracker = RateLimitTracker::new();
-        tracker.parse_from_error("acc1", 429, Some("30"), "");
-        let wait = tracker.get_remaining_wait("acc1");
+        tracker.parse_from_error("acc1", "model-a", 429, Some("30"), "");
+        let wait = tracker.get_remaining_wait("acc1", Some("model-a"));
         assert!(wait > 25 && wait <= 30);
     }
 
@@ -440,8 +487,8 @@ mod tests {
     fn test_safety_buffer() {
         let tracker = RateLimitTracker::new();
         // 如果 API 返回 1s，我们强制设为 2s
-        tracker.parse_from_error("acc1", 429, Some("1"), "");
-        let wait = tracker.get_remaining_wait("acc1");
+        tracker.parse_from_error("acc1", "model-a", 429, Some("1"), "");
+        let wait = tracker.get_remaining_wait("acc1", Some("model-a"));
         assert_eq!(wait, 2);
     }
 }

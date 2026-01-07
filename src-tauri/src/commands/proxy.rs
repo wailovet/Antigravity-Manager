@@ -6,7 +6,7 @@ use serde::{Serialize, Deserialize};
 use crate::proxy::{ProxyConfig, TokenManager};
 use tokio::time::Duration;
 use crate::proxy::monitor::{ProxyMonitor, ProxyRequestLog, ProxyStats};
-use crate::proxy::rate_limit::RateLimitReason;
+use crate::proxy::rate_limit::{RateLimitInfo, RateLimitReason};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenLockSnapshot {
@@ -85,6 +85,8 @@ pub struct ProxyRuntimeStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitStatus {
     pub account_id: String,
+    pub model: String,
+    pub models: Vec<String>,
     pub reason: String,
     pub reset_at: i64,
     pub remaining_seconds: u64,
@@ -461,9 +463,9 @@ pub async fn get_proxy_rate_limits(
 
     let now = SystemTime::now();
     let snapshot = instance.token_manager.get_rate_limit_snapshot();
-    let mut out = Vec::with_capacity(snapshot.len());
+    let mut grouped: std::collections::HashMap<String, Vec<(String, RateLimitInfo)>> = std::collections::HashMap::new();
 
-    for (account_id, info) in snapshot {
+    for (key, info) in snapshot {
         let remaining = match info.reset_time.duration_since(now) {
             Ok(duration) => duration.as_secs(),
             Err(_) => 0,
@@ -471,14 +473,45 @@ pub async fn get_proxy_rate_limits(
         if remaining == 0 {
             continue;
         }
+        grouped
+            .entry(key.account_id.clone())
+            .or_default()
+            .push((key.model.clone(), info));
+    }
+
+    let mut out = Vec::with_capacity(grouped.len());
+    for (account_id, mut entries) in grouped {
+        entries.sort_by(|(model_a, info_a), (model_b, info_b)| {
+            let rem_a = info_a
+                .reset_time
+                .duration_since(now)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let rem_b = info_b
+                .reset_time
+                .duration_since(now)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            rem_b.cmp(&rem_a).then_with(|| model_a.cmp(model_b))
+        });
+
+        let (model, info) = entries[0].clone();
+        let remaining = info
+            .reset_time
+            .duration_since(now)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let reset_at = info
             .reset_time
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        let models = entries.into_iter().map(|(m, _)| m).collect();
 
         out.push(RateLimitStatus {
             account_id,
+            model,
+            models,
             reason: rate_limit_reason_code(info.reason).to_string(),
             reset_at,
             remaining_seconds: remaining,

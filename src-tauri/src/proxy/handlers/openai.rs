@@ -374,7 +374,7 @@ pub async fn handle_chat_completions(
         // 429/529/503 智能处理
         if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
             // 记录限流信息 (全局同步)
-            token_manager.mark_rate_limited(&account_id, status_code, retry_after.as_deref(), &error_text);
+            token_manager.mark_rate_limited(&account_id, &mapped_model, status_code, retry_after.as_deref(), &error_text);
 
             // 1. 优先尝试解析 RetryInfo (由 Google Cloud 直接下发)
             if let Some(delay_ms) = crate::proxy::upstream::retry::parse_retry_delay(&error_text) {

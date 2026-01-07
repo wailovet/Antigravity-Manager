@@ -2,7 +2,7 @@ import { X, Clock, AlertCircle } from 'lucide-react';
 import { createPortal } from 'react-dom';
 import { Account, ModelQuota } from '../../types/account';
 import { RateLimitStatus } from '../../types/rateLimit';
-import { formatDate, formatDurationSeconds } from '../../utils/format';
+import { formatDate, formatDurationSeconds, formatRateLimitModels } from '../../utils/format';
 import { useTranslation } from 'react-i18next';
 
 interface AccountDetailsDialogProps {
@@ -21,6 +21,7 @@ export default function AccountDetailsDialog({ account, rateLimit, onClose }: Ac
     const quotaUnknownLastAttempt = quotaUnknown && account.quota_last_attempt_at
         ? formatDate(account.quota_last_attempt_at)
         : null;
+    const rateLimitModel = rateLimit ? formatRateLimitModels(rateLimit.model, rateLimit.models) : null;
 
     return createPortal(
         <div className="modal modal-open z-[100]">
@@ -62,6 +63,11 @@ export default function AccountDetailsDialog({ account, rateLimit, onClose }: Ac
                                     <Clock size={12} />
                                     {t('accounts.rate_limit_badge', { time: formatDurationSeconds(rateLimit.remaining_seconds) })}
                                 </div>
+                                {rateLimitModel && (
+                                    <div>
+                                        {t('accounts.rate_limit_model')}: {rateLimitModel}
+                                    </div>
+                                )}
                                 <div>
                                     {t('accounts.rate_limit_reset')}: {formatDate(rateLimit.reset_at) || t('common.unknown')}
                                 </div>
