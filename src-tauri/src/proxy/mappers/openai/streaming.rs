@@ -230,6 +230,13 @@ pub fn create_openai_sse_stream(
                                             }
                                         }
                                     }
+
+                                    // 捕获 usageMetadata 用于最终的 usage 统计
+                                    if let Some(u) = actual_data.get("usageMetadata") {
+                                        if let Ok(usage_meta) = serde_json::from_value::<super::gemini_models::UsageMetadata>(u.clone()) {
+                                            final_usage = Some(super::utils::to_openai_usage(&usage_meta));
+                                        }
+                                    }
                                 }
                             }
                         }
