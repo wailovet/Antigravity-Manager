@@ -34,6 +34,7 @@ interface AccountState {
     syncAccountFromDb: () => Promise<void>;
     toggleProxyStatus: (accountId: string, enable: boolean, reason?: string) => Promise<void>;
     fetchRateLimits: () => Promise<void>;
+    clearRateLimit: (accountId: string) => Promise<void>;
 }
 
 export const useAccountStore = create<AccountState>((set, get) => ({
@@ -288,6 +289,17 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         } catch (error) {
             console.error('[AccountStore] Fetch rate limits failed:', error);
             set({ rateLimitError: String(error), rateLimitLoading: false });
+        }
+    },
+
+    clearRateLimit: async (accountId: string) => {
+        try {
+            await proxyService.clearProxyRateLimit(accountId);
+        } catch (error) {
+            console.error('[AccountStore] Clear rate limit failed:', error);
+            throw error;
+        } finally {
+            await get().fetchRateLimits();
         }
     },
 }));

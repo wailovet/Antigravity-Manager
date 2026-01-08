@@ -4,6 +4,7 @@ import { Account, ModelQuota } from '../../types/account';
 import { RateLimitStatus } from '../../types/rateLimit';
 import { formatDate, formatDurationSeconds, formatRateLimitModels } from '../../utils/format';
 import { useTranslation } from 'react-i18next';
+import { useAccountStore } from '../../stores/useAccountStore';
 
 interface AccountDetailsDialogProps {
     account: Account | null;
@@ -13,6 +14,7 @@ interface AccountDetailsDialogProps {
 
 export default function AccountDetailsDialog({ account, rateLimit, onClose }: AccountDetailsDialogProps) {
     const { t } = useTranslation();
+    const clearRateLimit = useAccountStore((s) => s.clearRateLimit);
     if (!account) return null;
     const quotaUnknown = !account.quota?.is_forbidden && (!account.quota?.models || account.quota.models.length === 0);
     const quotaUnknownReason = quotaUnknown
@@ -49,7 +51,8 @@ export default function AccountDetailsDialog({ account, rateLimit, onClose }: Ac
                 <div className="p-6 grid grid-cols-1 md:grid-cols-2 gap-4 max-h-[60vh] overflow-y-auto">
                     {rateLimit && (
                         <div className="md:col-span-2 p-4 rounded-xl border border-amber-100 dark:border-amber-900/40 bg-amber-50/60 dark:bg-amber-900/20">
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-2 justify-between">
+                                <div className="flex items-center gap-2">
                                 <AlertCircle className="w-4 h-4 text-amber-500" />
                                 <span className="text-sm font-semibold text-amber-700 dark:text-amber-300">
                                     {t('accounts.rate_limit_active')}
@@ -57,6 +60,21 @@ export default function AccountDetailsDialog({ account, rateLimit, onClose }: Ac
                                 <span className="text-xs text-amber-600/80 dark:text-amber-300/80">
                                     {t(`accounts.rate_limit_reasons.${rateLimit.reason}`)}
                                 </span>
+                                </div>
+                                <button
+                                    className="btn btn-xs btn-outline border-amber-300 text-amber-700 hover:bg-amber-100 hover:border-amber-300 dark:border-amber-800/60 dark:text-amber-200 dark:hover:bg-amber-900/30"
+                                    onClick={async () => {
+                                        if (!confirm(t('accounts.clear_cooldown_confirm'))) return;
+                                        try {
+                                            await clearRateLimit(account.id);
+                                        } catch (e) {
+                                            alert(String(e));
+                                        }
+                                    }}
+                                    title={t('accounts.clear_cooldown_tooltip')}
+                                >
+                                    {t('accounts.clear_cooldown')}
+                                </button>
                             </div>
                             <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs text-amber-700/90 dark:text-amber-200/80">
                                 <div className="flex items-center gap-1.5">

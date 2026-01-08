@@ -119,6 +119,7 @@ pub fn run() {
             commands::proxy::get_proxy_logs,
             commands::proxy::get_proxy_runtime_status,
             commands::proxy::get_proxy_rate_limits,
+            commands::proxy::clear_proxy_rate_limit,
             commands::proxy::set_proxy_monitor_enabled,
             commands::proxy::clear_proxy_logs,
             commands::proxy::generate_api_key,

@@ -522,6 +522,20 @@ pub async fn get_proxy_rate_limits(
     Ok(out)
 }
 
+#[tauri::command]
+pub async fn clear_proxy_rate_limit(
+    state: State<'_, ProxyServiceState>,
+    account_id: String,
+) -> Result<bool, String> {
+    let instance_lock = state.instance.read().await;
+    let instance = match instance_lock.as_ref() {
+        Some(instance) => instance,
+        None => return Err("服务未运行".to_string()),
+    };
+
+    Ok(instance.token_manager.clear_rate_limit(&account_id))
+}
+
 /// 生成 API Key
 #[tauri::command]
 pub fn generate_api_key() -> String {
