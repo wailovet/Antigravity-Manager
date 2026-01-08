@@ -162,6 +162,12 @@ pub fn transform_openai_response(gemini_response: &Value) -> OpenAIResponse {
         }
     }
 
+    // 处理 Usage
+    let usage = raw
+        .get("usageMetadata")
+        .and_then(|u| serde_json::from_value::<super::gemini_models::UsageMetadata>(u.clone()).ok())
+        .map(|u| super::utils::to_openai_usage(&u));
+
     OpenAIResponse {
         id: raw
             .get("responseId")
@@ -176,6 +182,7 @@ pub fn transform_openai_response(gemini_response: &Value) -> OpenAIResponse {
             .unwrap_or("unknown")
             .to_string(),
         choices,
+        usage,
     }
 }
 
