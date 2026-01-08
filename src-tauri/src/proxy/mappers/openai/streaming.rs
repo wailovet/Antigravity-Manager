@@ -54,7 +54,6 @@ pub fn create_openai_sse_stream(
     mut gemini_stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     model: String,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> {
-    let stream_id = format!("chatcmpl-{}", Uuid::new_v4());
     let mut final_usage = None;
  
     // 在流开始时生成固定的 ID 和 timestamp，所有 chunk 共用
