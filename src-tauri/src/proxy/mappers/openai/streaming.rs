@@ -55,7 +55,7 @@ pub fn create_openai_sse_stream(
     model: String,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> {
     let stream_id = format!("chatcmpl-{}", Uuid::new_v4());
-    let mut final_usage = None;
+    let mut final_usage: Option<super::models::Usage> = None;
 
     let stream = async_stream::stream! {
         let mut buffer = BytesMut::new();
