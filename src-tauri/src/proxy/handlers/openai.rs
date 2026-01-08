@@ -9,15 +9,159 @@ use crate::proxy::mappers::openai::{
 };
 // use crate::proxy::upstream::client::UpstreamClient; // 通过 state 获取
 use crate::proxy::server::AppState;
+use crate::proxy::observability::RequestAttribution;
+use crate::proxy::privacy::{mask_email, stable_hash_hex};
 
 const MAX_RETRY_ATTEMPTS: usize = 3;
 use crate::proxy::session_manager::SessionManager;
+use crate::proxy::common::model_mapping::ModelAvailability;
+
+fn attach_attribution(
+    response: &mut axum::response::Response,
+    provider: &str,
+    resolved_model: Option<String>,
+    account_email: Option<&str>,
+) {
+    let (account_id, account_email_masked) = match account_email {
+        Some(email) => (Some(stable_hash_hex(email)), Some(mask_email(email))),
+        None => (None, None),
+    };
+
+    response.extensions_mut().insert(RequestAttribution {
+        provider: provider.to_string(),
+        resolved_model,
+        account_id,
+        account_email_masked,
+    });
+}
+
+fn detect_openai_thinking_preference(model: &str, body: &Value) -> bool {
+    let lower = model.to_lowercase();
+    let explicit_family = lower.contains("claude-opus")
+        || lower.contains("claude-sonnet")
+        || lower.contains("claude-haiku");
+
+    if let Some(thinking) = body.get("thinking") {
+        if let Some(kind) = thinking.get("type").and_then(|v| v.as_str()) {
+            return kind == "enabled";
+        }
+    }
+
+    if let Some(reasoning) = body.get("reasoning") {
+        if let Some(effort) = reasoning.get("effort").and_then(|v| v.as_str()) {
+            return effort != "none";
+        }
+    }
+
+    if lower.contains("thinking") {
+        return true;
+    }
+
+    if explicit_family && !lower.contains("thinking") {
+        return false;
+    }
+
+    true
+}
+
+fn select_first_available(
+    availability: &ModelAvailability,
+    candidates: &[&str],
+    min_percent: i32,
+) -> Option<String> {
+    for candidate in candidates {
+        if availability.is_model_available_with_min_percent(candidate, min_percent) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn select_openai_claude_target(
+    model: &str,
+    thinking_enabled: bool,
+    availability: &ModelAvailability,
+    min_percent: i32,
+) -> Option<String> {
+    let lower = model.to_lowercase();
+    let is_openai_model = lower.starts_with("gpt-")
+        || lower.starts_with("o1-")
+        || lower.starts_with("o3-")
+        || lower.starts_with("o4-");
+
+    let family = if lower.contains("claude-opus") {
+        Some("opus")
+    } else if lower.contains("claude-sonnet") {
+        Some("sonnet")
+    } else if lower.contains("claude-haiku") {
+        Some("haiku")
+    } else if is_openai_model {
+        Some("opus")
+    } else {
+        None
+    };
+
+    match family {
+        Some("haiku") => select_first_available(
+            availability,
+            &["gemini-3-pro-high", "gemini-3-flash"],
+            min_percent,
+        ),
+        Some("opus") => {
+            if thinking_enabled {
+                select_first_available(
+                    availability,
+                    &[
+                        "claude-opus-4-5-thinking",
+                        "claude-sonnet-4-5-thinking",
+                        "gemini-3-pro-high",
+                        "claude-sonnet-4-5",
+                        "gemini-3-flash",
+                    ],
+                    min_percent,
+                )
+            } else {
+                select_first_available(
+                    availability,
+                    &["gemini-3-pro-high", "gemini-3-flash"],
+                    min_percent,
+                )
+            }
+        }
+        Some("sonnet") => {
+            if thinking_enabled {
+                select_first_available(
+                    availability,
+                    &[
+                        "claude-sonnet-4-5-thinking",
+                        "gemini-3-pro-high",
+                        "claude-sonnet-4-5",
+                        "gemini-3-flash",
+                    ],
+                    min_percent,
+                )
+            } else {
+                select_first_available(
+                    availability,
+                    &[
+                        "claude-sonnet-4-5",
+                        "claude-sonnet-4-5-thinking",
+                        "gemini-3-pro-high",
+                        "gemini-3-flash",
+                    ],
+                    min_percent,
+                )
+            }
+        }
+        _ => None,
+    }
+}
 
 pub async fn handle_chat_completions(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let mut openai_req: OpenAIRequest = serde_json::from_value(body)
+    let mut openai_req: OpenAIRequest = serde_json::from_value(body.clone())
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid request: {}", e)))?;
 
     // Safety: Ensure messages is not empty
@@ -43,17 +187,58 @@ pub async fn handle_chat_completions(
     let token_manager = state.token_manager;
     let pool_size = token_manager.len();
     let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
+    let availability = token_manager.model_availability_snapshot();
 
     let mut last_error = String::new();
 
     for attempt in 0..max_attempts {
-        // 2. 预解析模型路由与配置
-        let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        let thinking_enabled = detect_openai_thinking_preference(&openai_req.model, &body);
+        let min_percent = if thinking_enabled {
+            if availability.has_healthy_thinking_models {
+                crate::proxy::common::model_mapping::LOW_QUOTA_THRESHOLD_PERCENT
+            } else {
+                0
+            }
+        } else if availability.has_healthy_models {
+            crate::proxy::common::model_mapping::LOW_QUOTA_THRESHOLD_PERCENT
+        } else {
+            0
+        };
+        let custom_target = {
+            let custom_mapping = state.custom_mapping.read().await;
+            custom_mapping.get(&openai_req.model).cloned()
+        };
+
+        let mut route_source = "resolver";
+        let mapped_model = if let Some(target) = custom_target {
+            route_source = "custom";
+            target
+        } else if let Some(target) = select_openai_claude_target(
             &openai_req.model,
-            &*state.custom_mapping.read().await,
-            &*state.openai_mapping.read().await,
-            &*state.anthropic_mapping.read().await,
-            false,  // OpenAI 请求不应用 Claude 家族映射
+            thinking_enabled,
+            &availability,
+            min_percent,
+        )
+        {
+            route_source = "priority";
+            target
+        } else {
+            crate::proxy::common::model_mapping::resolve_model_route_with_availability(
+                &openai_req.model,
+                &*state.custom_mapping.read().await,
+                &*state.openai_mapping.read().await,
+                &*state.anthropic_mapping.read().await,
+                false,  // OpenAI 请求不应用 Claude 家族映射
+                Some(&availability),
+                min_percent,
+            )
+        };
+        info!(
+            "[Router] OpenAI route ({}): {} -> {} (thinking_enabled: {})",
+            route_source,
+            openai_req.model,
+            mapped_model,
+            thinking_enabled
         );
         // 将 OpenAI 工具转为 Value 数组以便探测联网
         let tools_val: Option<Vec<Value>> = openai_req
@@ -71,16 +256,33 @@ pub async fn handle_chat_completions(
 
         // 4. 获取 Token (使用准确的 request_type)
         // 关键：在重试尝试 (attempt > 0) 时强制轮换账号
-        let (access_token, project_id, email) = match token_manager
-            .get_token(&config.request_type, attempt > 0, Some(&session_id))
+        let (access_token, project_id, email, account_id) = match token_manager
+            .get_token(
+                &config.request_type,
+                attempt > 0,
+                Some(&session_id),
+                Some(&mapped_model),
+                min_percent,
+            )
             .await
         {
             Ok(t) => t,
             Err(e) => {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Token error: {}", e),
-                ));
+                let status = match e {
+                    crate::proxy::token_manager::TokenSelectionError::ModelQuotaUnavailable { .. } => {
+                        StatusCode::TOO_MANY_REQUESTS
+                    }
+                    crate::proxy::token_manager::TokenSelectionError::NoAvailableAccounts(_) => {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                };
+                let message = e.to_string();
+                if openai_req.stream {
+                    let resp = crate::proxy::errors::openai_sse_error(status, message);
+                    return Ok(resp);
+                }
+                let resp = crate::proxy::errors::openai_error(status, message);
+                return Ok(resp);
             }
         };
 
@@ -134,15 +336,15 @@ pub async fn handle_chat_completions(
                     create_openai_sse_stream(Box::pin(gemini_stream), openai_req.model.clone());
                 let body = Body::from_stream(openai_stream);
 
-                return Ok(Response::builder()
+                let mut resp = Response::builder()
                     .header("Content-Type", "text/event-stream")
                     .header("Cache-Control", "no-cache")
                     .header("Connection", "keep-alive")
-                    .header("X-Account-Email", &email)
-                    .header("X-Mapped-Model", &mapped_model)
                     .body(body)
                     .unwrap()
-                    .into_response());
+                    .into_response();
+                attach_attribution(&mut resp, "google", Some(mapped_model.clone()), Some(&email));
+                return Ok(resp);
             }
 
             let gemini_resp: Value = response
@@ -151,7 +353,9 @@ pub async fn handle_chat_completions(
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
 
             let openai_response = transform_openai_response(&gemini_resp);
-            return Ok((StatusCode::OK, [("X-Account-Email", email.as_str()), ("X-Mapped-Model", mapped_model.as_str())], Json(openai_response)).into_response());
+            let mut resp = Json(openai_response).into_response();
+            attach_attribution(&mut resp, "google", Some(mapped_model.clone()), Some(&email));
+            return Ok(resp);
         }
 
         // 处理特定错误并重试
@@ -170,7 +374,7 @@ pub async fn handle_chat_completions(
         // 429/529/503 智能处理
         if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
             // 记录限流信息 (全局同步)
-            token_manager.mark_rate_limited(&email, status_code, retry_after.as_deref(), &error_text);
+            token_manager.mark_rate_limited(&account_id, &mapped_model, status_code, retry_after.as_deref(), &error_text);
 
             // 1. 优先尝试解析 RetryInfo (由 Google Cloud 直接下发)
             if let Some(delay_ms) = crate::proxy::upstream::retry::parse_retry_delay(&error_text) {
@@ -518,16 +722,58 @@ pub async fn handle_completions(
     let token_manager = state.token_manager;
     let pool_size = token_manager.len();
     let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
+    let availability = token_manager.model_availability_snapshot();
 
     let mut last_error = String::new();
 
     for _attempt in 0..max_attempts {
-        let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        let thinking_enabled = detect_openai_thinking_preference(&openai_req.model, &body);
+        let min_percent = if thinking_enabled {
+            if availability.has_healthy_thinking_models {
+                crate::proxy::common::model_mapping::LOW_QUOTA_THRESHOLD_PERCENT
+            } else {
+                0
+            }
+        } else if availability.has_healthy_models {
+            crate::proxy::common::model_mapping::LOW_QUOTA_THRESHOLD_PERCENT
+        } else {
+            0
+        };
+        let custom_target = {
+            let custom_mapping = state.custom_mapping.read().await;
+            custom_mapping.get(&openai_req.model).cloned()
+        };
+
+        let mut route_source = "resolver";
+        let mapped_model = if let Some(target) = custom_target {
+            route_source = "custom";
+            target
+        } else if let Some(target) = select_openai_claude_target(
             &openai_req.model,
-            &*state.custom_mapping.read().await,
-            &*state.openai_mapping.read().await,
-            &*state.anthropic_mapping.read().await,
-            false,  // OpenAI 请求不应用 Claude 家族映射
+            thinking_enabled,
+            &availability,
+            min_percent,
+        )
+        {
+            route_source = "priority";
+            target
+        } else {
+            crate::proxy::common::model_mapping::resolve_model_route_with_availability(
+                &openai_req.model,
+                &*state.custom_mapping.read().await,
+                &*state.openai_mapping.read().await,
+                &*state.anthropic_mapping.read().await,
+                false,  // OpenAI 请求不应用 Claude 家族映射
+                Some(&availability),
+                min_percent,
+            )
+        };
+        info!(
+            "[Router] OpenAI route ({}): {} -> {} (thinking_enabled: {})",
+            route_source,
+            openai_req.model,
+            mapped_model,
+            thinking_enabled
         );
         // 将 OpenAI 工具转为 Value 数组以便探测联网
         let tools_val: Option<Vec<Value>> = openai_req
@@ -540,16 +786,35 @@ pub async fn handle_completions(
             &tools_val,
         );
 
-        let (access_token, project_id, email) =
-            match token_manager.get_token(&config.request_type, false, None).await {
-                Ok(t) => t,
-                Err(e) => {
-                    return Err((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("Token error: {}", e),
-                    ))
+        let (access_token, project_id, email, _account_id) = match token_manager
+            .get_token(
+                &config.request_type,
+                false,
+                None,
+                Some(&mapped_model),
+                min_percent,
+            )
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                let status = match e {
+                    crate::proxy::token_manager::TokenSelectionError::ModelQuotaUnavailable { .. } => {
+                        StatusCode::TOO_MANY_REQUESTS
+                    }
+                    crate::proxy::token_manager::TokenSelectionError::NoAvailableAccounts(_) => {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                };
+                let message = e.to_string();
+                if openai_req.stream {
+                    let resp = crate::proxy::errors::openai_sse_error(status, message);
+                    return Ok(resp);
                 }
-            };
+                let resp = crate::proxy::errors::openai_error(status, message);
+                return Ok(resp);
+            }
+        };
 
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
@@ -598,15 +863,15 @@ pub async fn handle_completions(
                     Body::from_stream(s)
                 };
 
-                return Ok(Response::builder()
+                let mut resp = Response::builder()
                     .header("Content-Type", "text/event-stream")
                     .header("Cache-Control", "no-cache")
                     .header("Connection", "keep-alive")
-                    .header("X-Account-Email", &email)
-                    .header("X-Mapped-Model", &mapped_model)
                     .body(body)
                     .unwrap()
-                    .into_response());
+                    .into_response();
+                attach_attribution(&mut resp, "google", Some(mapped_model.clone()), Some(&email));
+                return Ok(resp);
             }
 
             let gemini_resp: Value = response
@@ -637,7 +902,9 @@ pub async fn handle_completions(
                 "choices": choices
             });
 
-            return Ok(axum::Json(legacy_resp).into_response());
+            let mut resp = axum::Json(legacy_resp).into_response();
+            attach_attribution(&mut resp, "google", Some(mapped_model.clone()), Some(&email));
+            return Ok(resp);
         }
 
         // Handle errors and retry
@@ -753,15 +1020,29 @@ pub async fn handle_images_generations(
     // 3. 获取 Token
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
+    let availability = token_manager.model_availability_snapshot();
+    let min_percent = if availability.has_healthy_models {
+        crate::proxy::common::model_mapping::LOW_QUOTA_THRESHOLD_PERCENT
+    } else {
+        0
+    };
 
-    let (access_token, project_id, email) = match token_manager.get_token("image_gen", false, None).await
+    let (access_token, project_id, email, _account_id) = match token_manager
+        .get_token("image_gen", false, None, Some(model), min_percent)
+        .await
     {
         Ok(t) => t,
         Err(e) => {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Token error: {}", e),
-            ))
+            let status = match e {
+                crate::proxy::token_manager::TokenSelectionError::ModelQuotaUnavailable { .. } => {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+                crate::proxy::token_manager::TokenSelectionError::NoAvailableAccounts(_) => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            };
+            let resp = crate::proxy::errors::openai_error(status, e.to_string());
+            return Ok(resp);
         }
     };
 
@@ -910,7 +1191,7 @@ pub async fn handle_images_generations(
         "data": images
     });
 
-    Ok(Json(openai_response))
+    Ok(Json(openai_response).into_response())
 }
 
 pub async fn handle_images_edits(
@@ -1003,15 +1284,29 @@ pub async fn handle_images_edits(
     // 1. 获取 Upstream
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
+    let availability = token_manager.model_availability_snapshot();
+    let min_percent = if availability.has_healthy_models {
+        crate::proxy::common::model_mapping::LOW_QUOTA_THRESHOLD_PERCENT
+    } else {
+        0
+    };
     // Fix: Proper get_token call with correct signature and unwrap (using image_gen quota)
-    let (access_token, project_id, _email) = match token_manager.get_token("image_gen", false, None).await
+    let (access_token, project_id, _email, _account_id) = match token_manager
+        .get_token("image_gen", false, None, Some(&model), min_percent)
+        .await
     {
         Ok(t) => t,
         Err(e) => {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Token error: {}", e),
-            ))
+            let status = match e {
+                crate::proxy::token_manager::TokenSelectionError::ModelQuotaUnavailable { .. } => {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+                crate::proxy::token_manager::TokenSelectionError::NoAvailableAccounts(_) => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            };
+            let resp = crate::proxy::errors::openai_error(status, e.to_string());
+            return Ok(resp);
         }
     };
 
@@ -1182,5 +1477,5 @@ pub async fn handle_images_edits(
         "data": images
     });
 
-    Ok(Json(openai_response))
+    Ok(Json(openai_response).into_response())
 }

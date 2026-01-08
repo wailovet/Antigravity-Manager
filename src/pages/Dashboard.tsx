@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
-import { Users, Sparkles, Bot, AlertTriangle, ArrowRight, Download, RefreshCw } from 'lucide-react';
+import { Users, Sparkles, Bot, AlertTriangle, ArrowRight, Download, RefreshCw, Clock } from 'lucide-react';
 import { useAccountStore } from '../stores/useAccountStore';
 import CurrentAccount from '../components/dashboard/CurrentAccount';
 import BestAccounts from '../components/dashboard/BestAccounts';
@@ -22,7 +22,8 @@ function Dashboard() {
         switchAccount,
         addAccount,
         refreshQuota,
-        loading
+        loading,
+        rateLimits
     } = useAccountStore();
 
     useEffect(() => {
@@ -50,6 +51,7 @@ function Dashboard() {
             const claude = a.quota?.models.find(m => m.name.toLowerCase() === 'claude-sonnet-4-5')?.percentage || 0;
             return gemini < 20 || claude < 20;
         }).length;
+        const rateLimited = accounts.filter(a => rateLimits[a.id]).length;
 
         return {
             total: accounts.length,
@@ -63,8 +65,9 @@ function Dashboard() {
                 ? Math.round(claudeQuotas.reduce((a, b) => a + b, 0) / claudeQuotas.length)
                 : 0,
             lowQuota: lowQuotaCount,
+            rateLimited,
         };
-    }, [accounts]);
+    }, [accounts, rateLimits]);
 
     const isSwitchingRef = useRef(false);
 
@@ -179,8 +182,8 @@ function Dashboard() {
                     </div>
                 </div>
 
-                {/* 统计卡片 - 5 columns on medium screens and up */}
-                <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                {/* 统计卡片 - 6 columns on medium screens and up */}
+                <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
                     <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200">
                         <div className="flex items-center justify-between mb-2">
                             <div className="p-1.5 bg-blue-50 dark:bg-blue-900/20 rounded-md">
@@ -245,6 +248,17 @@ function Dashboard() {
                         <div className="text-2xl font-bold text-gray-900 dark:text-base-content mb-0.5">{stats.lowQuota}</div>
                         <div className="text-xs text-gray-500 dark:text-gray-400">{t('dashboard.low_quota_accounts')}</div>
                         <div className="text-[10px] text-gray-400 dark:text-gray-500 mt-1">{t('dashboard.quota_desc')}</div>
+                    </div>
+
+                    <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200">
+                        <div className="flex items-center justify-between mb-2">
+                            <div className="p-1.5 bg-amber-50 dark:bg-amber-900/20 rounded-md">
+                                <Clock className="w-4 h-4 text-amber-500 dark:text-amber-400" />
+                            </div>
+                        </div>
+                        <div className="text-2xl font-bold text-gray-900 dark:text-base-content mb-0.5">{stats.rateLimited}</div>
+                        <div className="text-xs text-gray-500 dark:text-gray-400">{t('dashboard.rate_limited_accounts')}</div>
+                        <div className="text-[10px] text-gray-400 dark:text-gray-500 mt-1">{t('dashboard.rate_limit_desc')}</div>
                     </div>
                 </div>
 

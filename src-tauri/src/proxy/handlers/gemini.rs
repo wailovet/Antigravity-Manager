@@ -6,8 +6,29 @@ use tracing::{debug, error, info};
 use crate::proxy::mappers::gemini::{wrap_request, unwrap_response};
 use crate::proxy::server::AppState;
 use crate::proxy::session_manager::SessionManager;
+use crate::proxy::observability::RequestAttribution;
+use crate::proxy::privacy::{mask_email, stable_hash_hex};
  
 const MAX_RETRY_ATTEMPTS: usize = 3;
+
+fn attach_attribution(
+    response: &mut axum::response::Response,
+    provider: &str,
+    resolved_model: Option<String>,
+    account_email: Option<&str>,
+) {
+    let (account_id, account_email_masked) = match account_email {
+        Some(email) => (Some(stable_hash_hex(email)), Some(mask_email(email))),
+        None => (None, None),
+    };
+
+    response.extensions_mut().insert(RequestAttribution {
+        provider: provider.to_string(),
+        resolved_model,
+        account_id,
+        account_email_masked,
+    });
+}
  
 /// 处理 generateContent 和 streamGenerateContent
 /// 路径参数: model_name, method (e.g. "gemini-pro", "generateContent")
@@ -36,17 +57,35 @@ pub async fn handle_generate(
     let token_manager = state.token_manager;
     let pool_size = token_manager.len();
     let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
+    let availability = token_manager.model_availability_snapshot();
     
     let mut last_error = String::new();
 
     for attempt in 0..max_attempts {
+        let thinking_enabled = body
+            .get("generationConfig")
+            .and_then(|v| v.get("thinkingConfig"))
+            .is_some();
+        let min_percent = if thinking_enabled {
+            if availability.has_healthy_thinking_models {
+                crate::proxy::common::model_mapping::LOW_QUOTA_THRESHOLD_PERCENT
+            } else {
+                0
+            }
+        } else if availability.has_healthy_models {
+            crate::proxy::common::model_mapping::LOW_QUOTA_THRESHOLD_PERCENT
+        } else {
+            0
+        };
         // 3. 模型路由与配置解析
-        let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        let mapped_model = crate::proxy::common::model_mapping::resolve_model_route_with_availability(
             &model_name,
             &*state.custom_mapping.read().await,
             &*state.openai_mapping.read().await,
             &*state.anthropic_mapping.read().await,
             false,  // Gemini 请求不应用 Claude 家族映射
+            Some(&availability),
+            min_percent,
         );
         // 提取 tools 列表以进行联网探测 (Gemini 风格可能是嵌套的)
         let tools_val: Option<Vec<Value>> = body.get("tools").and_then(|t| t.as_array()).map(|arr| {
@@ -62,16 +101,45 @@ pub async fn handle_generate(
         });
 
         let config = crate::proxy::mappers::common_utils::resolve_request_config(&model_name, &mapped_model, &tools_val);
+        info!(
+            "[Router] Gemini route: {} -> {} (type: {})",
+            model_name,
+            mapped_model,
+            config.request_type
+        );
 
         // 4. 获取 Token (使用准确的 request_type)
         // 提取 SessionId (粘性指纹)
         let session_id = SessionManager::extract_gemini_session_id(&body, &model_name);
 
         // 关键：在重试尝试 (attempt > 0) 时强制轮换账号
-        let (access_token, project_id, email) = match token_manager.get_token(&config.request_type, attempt > 0, Some(&session_id)).await {
+        let (access_token, project_id, email, account_id) = match token_manager
+            .get_token(
+                &config.request_type,
+                attempt > 0,
+                Some(&session_id),
+                Some(&mapped_model),
+                min_percent,
+            )
+            .await
+        {
             Ok(t) => t,
             Err(e) => {
-                return Err((StatusCode::SERVICE_UNAVAILABLE, format!("Token error: {}", e)));
+                let status = match e {
+                    crate::proxy::token_manager::TokenSelectionError::ModelQuotaUnavailable { .. } => {
+                        StatusCode::TOO_MANY_REQUESTS
+                    }
+                    crate::proxy::token_manager::TokenSelectionError::NoAvailableAccounts(_) => {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                };
+                let message = e.to_string();
+                if is_stream {
+                    let resp = crate::proxy::errors::gemini_sse_error(status, message);
+                    return Ok(resp);
+                }
+                let resp = crate::proxy::errors::gemini_error(status, message);
+                return Ok(resp);
             }
         };
 
@@ -161,15 +229,15 @@ pub async fn handle_generate(
                 };
                 
                 let body = Body::from_stream(stream);
-                return Ok(Response::builder()
+                let mut resp = Response::builder()
                     .header("Content-Type", "text/event-stream")
                     .header("Cache-Control", "no-cache")
                     .header("Connection", "keep-alive")
-                    .header("X-Account-Email", &email)
-                    .header("X-Mapped-Model", &mapped_model)
                     .body(body)
                     .unwrap()
-                    .into_response());
+                    .into_response();
+                attach_attribution(&mut resp, "google", Some(mapped_model.clone()), Some(&email));
+                return Ok(resp);
             }
 
             let gemini_resp: Value = response
@@ -178,7 +246,9 @@ pub async fn handle_generate(
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
 
             let unwrapped = unwrap_response(&gemini_resp);
-            return Ok((StatusCode::OK, [("X-Account-Email", email.as_str()), ("X-Mapped-Model", mapped_model.as_str())], Json(unwrapped)).into_response());
+            let mut resp = Json(unwrapped).into_response();
+            attach_attribution(&mut resp, "google", Some(mapped_model.clone()), Some(&email));
+            return Ok(resp);
         }
 
         // 处理错误并重试
@@ -190,7 +260,7 @@ pub async fn handle_generate(
         // 只有 429 (限流), 529 (过载), 503, 403 (权限) 和 401 (认证失效) 触发账号轮换
         if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 || status_code == 403 || status_code == 401 {
             // 记录限流信息 (全局同步)
-            token_manager.mark_rate_limited(&email, status_code, retry_after.as_deref(), &error_text);
+            token_manager.mark_rate_limited(&account_id, &mapped_model, status_code, retry_after.as_deref(), &error_text);
 
             // 只有明确包含 "QUOTA_EXHAUSTED" 才停止，避免误判上游的频率限制提示 (如 "check quota")
             if status_code == 429 && error_text.contains("QUOTA_EXHAUSTED") {
@@ -248,7 +318,9 @@ pub async fn handle_get_model(Path(model_name): Path<String>) -> impl IntoRespon
 
 pub async fn handle_count_tokens(State(state): State<AppState>, Path(_model_name): Path<String>, Json(_body): Json<Value>) -> Result<impl IntoResponse, (StatusCode, String)> {
     let model_group = "gemini";
-    let (_access_token, _project_id, _) = state.token_manager.get_token(model_group, false, None).await
+    let (_access_token, _project_id, _, _account_id) = state.token_manager
+        .get_token(model_group, false, None, None, 0)
+        .await
         .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("Token error: {}", e)))?;
     
     Ok(Json(json!({"totalTokens": 0})))

@@ -1,11 +1,13 @@
-import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, Clock, ToggleLeft, ToggleRight } from 'lucide-react';
+import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, Clock, AlertCircle, ToggleLeft, ToggleRight } from 'lucide-react';
 import { Account } from '../../types/account';
-import { getQuotaColor, formatTimeRemaining, getTimeRemainingColor } from '../../utils/format';
+import { RateLimitStatus } from '../../types/rateLimit';
+import { getQuotaColor, formatTimeRemaining, getTimeRemainingColor, formatDurationSeconds, formatDate, formatRateLimitModels } from '../../utils/format';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
 
 interface AccountCardProps {
     account: Account;
+    rateLimit?: RateLimitStatus;
     selected: boolean;
     onSelect: () => void;
     isCurrent: boolean;
@@ -20,13 +22,26 @@ interface AccountCardProps {
 }
 
 
-function AccountCard({ account, selected, onSelect, isCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy }: AccountCardProps) {
+function AccountCard({ account, rateLimit, selected, onSelect, isCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy }: AccountCardProps) {
     const { t } = useTranslation();
     const geminiProModel = account.quota?.models.find(m => m.name === 'gemini-3-pro-high');
     const geminiFlashModel = account.quota?.models.find(m => m.name === 'gemini-3-flash');
     const geminiImageModel = account.quota?.models.find(m => m.name === 'gemini-3-pro-image');
     const claudeModel = account.quota?.models.find(m => m.name === 'claude-sonnet-4-5-thinking');
     const isDisabled = Boolean(account.disabled);
+    const quotaUnknown = !account.quota?.is_forbidden && (!account.quota?.models || account.quota.models.length === 0);
+    const quotaUnknownReason = quotaUnknown
+        ? (account.quota_last_attempt_at ? t('accounts.quota_unknown_reason_recent') : t('accounts.quota_unknown_reason_initial'))
+        : '';
+    const quotaUnknownLastAttempt = quotaUnknown && account.quota_last_attempt_at
+        ? formatDate(account.quota_last_attempt_at)
+        : null;
+    const quotaUnknownTooltip = quotaUnknown
+        ? `${quotaUnknownReason}. ${t('accounts.quota_unknown_hint')}${quotaUnknownLastAttempt ? ` • ${t('accounts.quota_unknown_last_attempt')}: ${quotaUnknownLastAttempt}` : ''}`
+        : '';
+    const rateLimitReason = rateLimit ? t(`accounts.rate_limit_reasons.${rateLimit.reason}`) : '';
+    const rateLimitReset = rateLimit ? formatDate(rateLimit.reset_at) : null;
+    const rateLimitModel = rateLimit ? formatRateLimitModels(rateLimit.model, rateLimit.models) : null;
 
     const getColorClass = (percentage: number) => {
         const color = getQuotaColor(percentage);
@@ -92,6 +107,24 @@ function AccountCard({ account, selected, onSelect, isCurrent, isRefreshing, isS
                                 <span className="px-1.5 py-0.5 rounded-md bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-400 text-[9px] font-bold flex items-center gap-1 shadow-sm border border-red-200/50" title={t('accounts.forbidden_tooltip')}>
                                     <Lock className="w-2.5 h-2.5" />
                                     {t('accounts.forbidden').toUpperCase()}
+                                </span>
+                            )}
+                            {quotaUnknown && (
+                                <span
+                                    className="px-1.5 py-0.5 rounded-md bg-slate-100 dark:bg-slate-900/40 text-slate-600 dark:text-slate-300 text-[9px] font-bold flex items-center gap-1 shadow-sm border border-slate-200/60"
+                                    title={quotaUnknownTooltip}
+                                >
+                                    <AlertCircle className="w-2.5 h-2.5" />
+                                    {t('accounts.quota_unknown_badge').toUpperCase()}
+                                </span>
+                            )}
+                            {rateLimit && (
+                                <span
+                                    className="px-1.5 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 text-[9px] font-bold flex items-center gap-1 shadow-sm border border-amber-200/50"
+                                    title={`${t('accounts.rate_limit_reason')}: ${rateLimitReason}${rateLimitModel ? ` • ${t('accounts.rate_limit_model')}: ${rateLimitModel}` : ''}${rateLimitReset ? ` • ${t('accounts.rate_limit_reset')}: ${rateLimitReset}` : ''}`}
+                                >
+                                    <Clock className="w-2.5 h-2.5" />
+                                    {t('accounts.rate_limit_badge', { time: formatDurationSeconds(rateLimit.remaining_seconds) })}
                                 </span>
                             )}
                             {/* 订阅类型徽章 */}

@@ -5,6 +5,27 @@ use super::models::*;
 use crate::proxy::mappers::signature_store::get_thought_signature;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static THINKING_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static THINKING_DISABLED: AtomicU64 = AtomicU64::new(0);
+
+fn log_thinking_disable(reason: &str) {
+    let disabled = THINKING_DISABLED.fetch_add(1, Ordering::Relaxed) + 1;
+    let total = THINKING_REQUESTS.load(Ordering::Relaxed);
+    let ratio = if total > 0 {
+        (disabled as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+    tracing::warn!(
+        "[Thinking-Mode] Disabled: {} | disabled {}/{} ({:.1}%)",
+        reason,
+        disabled,
+        total,
+        ratio
+    );
+}
 
 // ===== Safety Settings Configuration =====
 
@@ -106,6 +127,39 @@ fn clean_cache_control_from_messages(messages: &mut [Message]) {
     }
 }
 
+fn is_empty_message_content(msg: &Message) -> bool {
+    match &msg.content {
+        MessageContent::String(text) => {
+            let trimmed = text.trim();
+            trimmed.is_empty() || trimmed == "(no content)"
+        }
+        MessageContent::Array(blocks) => {
+            if blocks.is_empty() {
+                return true;
+            }
+            blocks.iter().all(|block| match block {
+                ContentBlock::Text { text } => {
+                    let trimmed = text.trim();
+                    trimmed.is_empty() || trimmed == "(no content)"
+                }
+                _ => false,
+            })
+        }
+    }
+}
+
+fn drop_empty_messages(messages: &mut Vec<Message>) {
+    let before = messages.len();
+    messages.retain(|msg| !is_empty_message_content(msg));
+    let dropped = before.saturating_sub(messages.len());
+    if dropped > 0 {
+        tracing::warn!(
+            "[Claude-Request] Dropped {} empty message(s) before transform",
+            dropped
+        );
+    }
+}
+
 /// 转换 Claude 请求为 Gemini v1internal 格式
 pub fn transform_claude_request_in(
     claude_req: &ClaudeRequest,
@@ -116,6 +170,7 @@ pub fn transform_claude_request_in(
     // 原封不动发回导致的 "Extra inputs are not permitted" 错误
     let mut cleaned_req = claude_req.clone();
     clean_cache_control_from_messages(&mut cleaned_req.messages);
+    drop_empty_messages(&mut cleaned_req.messages);
     let claude_req = &cleaned_req; // 后续使用清理后的请求
 
     // 检测是否有联网工具 (server tool or built-in tool)
@@ -176,6 +231,9 @@ pub fn transform_claude_request_in(
             // If no thinking config is provided, enable by default for Opus models
             should_enable_thinking_by_default(&claude_req.model)
         });
+    if is_thinking_enabled {
+        THINKING_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    }
 
     // [NEW FIX] Check if target model supports thinking
     // Only models with "-thinking" suffix or Claude models support thinking
@@ -188,6 +246,7 @@ pub fn transform_claude_request_in(
             "[Thinking-Mode] Target model '{}' does not support thinking. Force disabling thinking mode.",
             mapped_model
         );
+        log_thinking_disable("target model does not support thinking");
         is_thinking_enabled = false;
     }
 
@@ -197,6 +256,7 @@ pub fn transform_claude_request_in(
         let should_disable = should_disable_thinking_due_to_history(&claude_req.messages);
         if should_disable {
              tracing::warn!("[Thinking-Mode] Automatically disabling thinking checks due to incompatible tool-use history (mixed application)");
+             log_thinking_disable("incompatible tool-use history");
              is_thinking_enabled = false;
         }
     }
@@ -509,7 +569,7 @@ fn build_contents(
                             }
                         }
                         ContentBlock::Thinking { thinking, signature, .. } => {
-                            tracing::error!("[DEBUG-TRANSFORM] Processing thinking block. Sig: {:?}", signature);
+                            tracing::debug!("[DEBUG-TRANSFORM] Processing thinking block. Sig: {:?}", signature);
                             
                             // [HOTFIX] Gemini Protocol Enforcement: Thinking block MUST be the first block.
                             // If we already have content (like Text), we must downgrade this thinking block to Text.
@@ -774,6 +834,14 @@ fn build_contents(
             continue;
         }
 
+        if parts.is_empty() {
+            tracing::warn!(
+                "[Claude-Request] Dropping message with empty content (role: {})",
+                role
+            );
+            continue;
+        }
+
         contents.push(json!({
             "role": role,
             "parts": parts
@@ -910,6 +978,7 @@ fn build_generation_config(
     is_thinking_enabled: bool
 ) -> Value {
     let mut config = json!({});
+    let max_tokens = claude_req.max_tokens.unwrap_or(64000);
 
     // Thinking 配置
     if let Some(thinking) = &claude_req.thinking {
@@ -924,6 +993,16 @@ fn build_generation_config(
                     has_web_search || claude_req.model.contains("gemini-2.5-flash");
                 if is_flash_model {
                     budget = budget.min(24576);
+                }
+                if max_tokens <= budget {
+                    let adjusted = max_tokens.saturating_sub(1);
+                    tracing::warn!(
+                        "[Thinking-Mode] Adjusting thinking budget {} -> {} to satisfy max_tokens ({}) constraint",
+                        budget,
+                        adjusted,
+                        max_tokens
+                    );
+                    budget = adjusted;
                 }
                 thinking_config["thinkingBudget"] = json!(budget);
             }
@@ -943,40 +1022,33 @@ fn build_generation_config(
         config["topK"] = json!(top_k);
     }
 
-    // Effort level mapping (Claude API v2.0.67+)
-    // Maps Claude's output_config.effort to Gemini's effortLevel
-    if let Some(output_config) = &claude_req.output_config {
-        if let Some(effort) = &output_config.effort {
-            config["effortLevel"] = json!(match effort.to_lowercase().as_str() {
-                "high" => "HIGH",
-                "medium" => "MEDIUM",
-                "low" => "LOW",
-                _ => "HIGH" // Default to HIGH for unknown values
-            });
-            tracing::debug!(
-                "[Generation-Config] Effort level set: {} -> {}",
-                effort,
-                config["effortLevel"]
-            );
-        }
-    }
+    // NOTE: Do not map Claude "effort" to Gemini generationConfig.
+    // Some clients (e.g. OpenCode) may send `output_config.effort`, but Gemini rejects
+    // unknown fields like `effortLevel` with INVALID_ARGUMENT.
 
     // web_search 强制 candidateCount=1
     /*if has_web_search {
         config["candidateCount"] = json!(1);
     }*/
 
-    // max_tokens 映射为 maxOutputTokens
-    config["maxOutputTokens"] = json!(64000);
+    // max_tokens 映射为 maxOutputTokens (fallback to a safe default)
+    config["maxOutputTokens"] = json!(max_tokens);
 
-    // [优化] 设置全局停止序列,防止流式输出冗余
-    config["stopSequences"] = json!([
-        "<|user|>",
-        "<|endoftext|>",
-        "<|end_of_turn|>",
-        "[DONE]",
-        "\n\nHuman:"
-    ]);
+    // Stop sequences: honor client-provided values when present, otherwise apply defaults.
+    if let Some(stop_sequences) = &claude_req.stop_sequences {
+        if !stop_sequences.is_empty() {
+            config["stopSequences"] = json!(stop_sequences);
+        }
+    } else {
+        // [优化] 设置全局停止序列，防止流式输出冗余 (参考 done-hub)
+        config["stopSequences"] = json!([
+            "<|user|>",
+            "<|endoftext|>",
+            "<|end_of_turn|>",
+            "[DONE]",
+            "\n\nHuman:"
+        ]);
+    }
 
     config
 }
@@ -1041,6 +1113,7 @@ mod tests {
             tools: None,
             stream: false,
             max_tokens: None,
+            stop_sequences: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -1138,6 +1211,7 @@ mod tests {
             tools: None,
             stream: false,
             max_tokens: None,
+            stop_sequences: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -1208,6 +1282,7 @@ mod tests {
             tools: None,
             stream: false,
             max_tokens: None,
+            stop_sequences: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -1280,6 +1355,7 @@ mod tests {
             ]),
             stream: false,
             max_tokens: None,
+            stop_sequences: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -1332,6 +1408,7 @@ mod tests {
             tools: None,
             stream: false,
             max_tokens: None,
+            stop_sequences: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -1382,6 +1459,7 @@ mod tests {
             tools: None,
             stream: false,
             max_tokens: None,
+            stop_sequences: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -1425,6 +1503,7 @@ mod tests {
             tools: None,
             stream: false,
             max_tokens: None,
+            stop_sequences: None,
             temperature: None,
             top_p: None,
             top_k: None,

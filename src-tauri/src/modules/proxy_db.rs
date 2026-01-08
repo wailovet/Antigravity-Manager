@@ -1,6 +1,11 @@
 use rusqlite::{params, Connection};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::path::PathBuf;
 use crate::proxy::monitor::ProxyRequestLog;
+
+const LOG_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+const LOG_CLEANUP_INTERVAL_SECS: i64 = 60 * 60;
+static LAST_LOG_CLEANUP_TS: AtomicI64 = AtomicI64::new(0);
 
 pub fn get_proxy_db_path() -> Result<PathBuf, String> {
     let data_dir = crate::modules::account::get_data_dir()?;
@@ -30,6 +35,10 @@ pub fn init_db() -> Result<(), String> {
     let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN response_body TEXT", []);
     let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN input_tokens INTEGER", []);
     let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN output_tokens INTEGER", []);
+    let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN provider TEXT", []);
+    let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN resolved_model TEXT", []);
+    let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN account_id TEXT", []);
+    let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN account_email_masked TEXT", []);
     let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN account_email TEXT", []);
     let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN mapped_model TEXT", []);
 
@@ -45,9 +54,21 @@ pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
     let db_path = get_proxy_db_path()?;
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
 
+    if let Err(e) = purge_logs_if_needed(&conn, log.timestamp) {
+        tracing::warn!("Failed to purge old proxy logs: {}", e);
+    }
+
     conn.execute(
-        "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, error, request_body, response_body, input_tokens, output_tokens, account_email, mapped_model)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT INTO request_logs (
+            id, timestamp, method, url, status, duration, model, mapped_model,
+            provider, resolved_model, account_id, account_email, account_email_masked,
+            error, request_body, response_body, input_tokens, output_tokens
+         )
+         VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+            ?9, ?10, ?11, ?12, ?13,
+            ?14, ?15, ?16, ?17, ?18
+         )",
         params![
             log.id,
             log.timestamp,
@@ -56,15 +77,41 @@ pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
             log.status,
             log.duration,
             log.model,
+            log.mapped_model,
+            log.provider,
+            log.resolved_model,
+            log.account_id,
+            log.account_email,
+            log.account_email_masked,
             log.error,
             log.request_body,
             log.response_body,
             log.input_tokens,
             log.output_tokens,
-            log.account_email,
-            log.mapped_model,
         ],
     ).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+fn purge_logs_if_needed(conn: &Connection, now: i64) -> Result<(), String> {
+    let last = LAST_LOG_CLEANUP_TS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < LOG_CLEANUP_INTERVAL_SECS {
+        return Ok(());
+    }
+    if LAST_LOG_CLEANUP_TS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    let cutoff = now.saturating_sub(LOG_RETENTION_SECS);
+    conn.execute(
+        "DELETE FROM request_logs WHERE timestamp < ?1",
+        params![cutoff],
+    )
+    .map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -74,9 +121,12 @@ pub fn get_logs(limit: usize) -> Result<Vec<ProxyRequestLog>, String> {
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
 
     let mut stmt = conn.prepare(
-        "SELECT id, timestamp, method, url, status, duration, model, error, request_body, response_body, input_tokens, output_tokens, account_email, mapped_model
-         FROM request_logs 
-         ORDER BY timestamp DESC 
+        "SELECT
+            id, timestamp, method, url, status, duration, model, mapped_model,
+            provider, resolved_model, account_id, account_email, account_email_masked,
+            error, request_body, response_body, input_tokens, output_tokens
+         FROM request_logs
+         ORDER BY timestamp DESC
          LIMIT ?1"
     ).map_err(|e| e.to_string())?;
 
@@ -89,13 +139,17 @@ pub fn get_logs(limit: usize) -> Result<Vec<ProxyRequestLog>, String> {
             status: row.get(4)?,
             duration: row.get(5)?,
             model: row.get(6)?,
-            mapped_model: row.get(13).unwrap_or(None),
-            account_email: row.get(12).unwrap_or(None),
-            error: row.get(7)?,
-            request_body: row.get(8).unwrap_or(None),
-            response_body: row.get(9).unwrap_or(None),
-            input_tokens: row.get(10).unwrap_or(None),
-            output_tokens: row.get(11).unwrap_or(None),
+            mapped_model: row.get(7).unwrap_or(None),
+            provider: row.get(8).unwrap_or(None),
+            resolved_model: row.get(9).unwrap_or(None),
+            account_id: row.get(10).unwrap_or(None),
+            account_email: row.get(11).unwrap_or(None),
+            account_email_masked: row.get(12).unwrap_or(None),
+            error: row.get(13)?,
+            request_body: row.get(14).unwrap_or(None),
+            response_body: row.get(15).unwrap_or(None),
+            input_tokens: row.get(16).unwrap_or(None),
+            output_tokens: row.get(17).unwrap_or(None),
         })
     }).map_err(|e| e.to_string())?;
 

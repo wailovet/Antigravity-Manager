@@ -4,7 +4,7 @@ import { useAccountStore } from '../../stores/useAccountStore';
 
 function BackgroundTaskRunner() {
     const { config } = useConfigStore();
-    const { refreshAllQuotas } = useAccountStore();
+    const { refreshAllQuotas, fetchRateLimits } = useAccountStore();
 
     // Use refs to track previous state to detect "off -> on" transitions
     const prevAutoRefreshRef = useRef(false);
@@ -70,6 +70,24 @@ function BackgroundTaskRunner() {
             }
         };
     }, [config?.auto_sync, config?.sync_interval]);
+
+    // Rate limit status polling
+    useEffect(() => {
+        let intervalId: ReturnType<typeof setTimeout> | null = null;
+
+        const tick = () => {
+            fetchRateLimits();
+        };
+
+        tick();
+        intervalId = setInterval(tick, 30 * 1000);
+
+        return () => {
+            if (intervalId) {
+                clearInterval(intervalId);
+            }
+        };
+    }, [fetchRateLimits]);
 
     // Render nothing
     return null;

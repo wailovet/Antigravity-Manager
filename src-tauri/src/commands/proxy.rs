@@ -1,10 +1,96 @@
 use tauri::State;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
 use crate::proxy::{ProxyConfig, TokenManager};
 use tokio::time::Duration;
 use crate::proxy::monitor::{ProxyMonitor, ProxyRequestLog, ProxyStats};
+use crate::proxy::rate_limit::{RateLimitInfo, RateLimitReason};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenLockSnapshot {
+    pub account_id: String,
+    pub age_secs: u64,
+    pub remaining_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolRuntimeSummary {
+    pub active_accounts: usize,
+    pub lock: Option<TokenLockSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderFlags {
+    pub zai_enabled: bool,
+    pub zai_dispatch_mode: crate::proxy::ZaiDispatchMode,
+    pub zai_mcp_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyAttributionEvent {
+    pub id: String,
+    pub timestamp: i64,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub duration: u64,
+    pub provider: Option<String>,
+    pub resolved_model: Option<String>,
+    pub account_id: Option<String>,
+    pub account_email_masked: Option<String>,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderAggregate {
+    pub provider: String,
+    pub requests: u64,
+    pub errors: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub last_seen: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AccountAggregate {
+    pub provider: String,
+    pub account_id: Option<String>,
+    pub account_email_masked: Option<String>,
+    pub requests: u64,
+    pub errors: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub last_seen: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyRuntimeStatus {
+    pub running: bool,
+    pub port: u16,
+    pub base_url: String,
+    pub allow_lan_access: bool,
+    pub auth_mode: crate::proxy::config::ProxyAuthMode,
+    pub effective_auth_mode: crate::proxy::config::ProxyAuthMode,
+    pub logging_enabled: bool,
+    pub providers: ProviderFlags,
+    pub pool: PoolRuntimeSummary,
+    pub recent: Vec<ProxyAttributionEvent>,
+    pub per_provider: Vec<ProviderAggregate>,
+    pub per_account: Vec<AccountAggregate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitStatus {
+    pub account_id: String,
+    pub model: String,
+    pub models: Vec<String>,
+    pub reason: String,
+    pub reset_at: i64,
+    pub remaining_seconds: u64,
+}
 
 
 /// 反代服务状态
@@ -103,6 +189,8 @@ pub async fn start_proxy_service(
             crate::proxy::ProxySecurityConfig::from_proxy_config(&config),
             config.zai.clone(),
             monitor.clone(),
+            config.access_log_enabled,
+            config.response_attribution_headers,
             config.experimental.clone(),
 
         ).await {
@@ -230,6 +318,237 @@ pub async fn clear_proxy_logs(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn get_proxy_runtime_status(
+    state: State<'_, ProxyServiceState>,
+    limit: Option<usize>,
+) -> Result<ProxyRuntimeStatus, String> {
+    let instance_lock = state.instance.read().await;
+
+    let (running, port, base_url, allow_lan_access, auth_mode, effective_auth_mode, logging_enabled, providers, pool_active_accounts) =
+        if let Some(instance) = instance_lock.as_ref() {
+            let cfg = &instance.config;
+            let security = crate::proxy::ProxySecurityConfig::from_proxy_config(cfg);
+            (
+                true,
+                cfg.port,
+                format!("http://127.0.0.1:{}", cfg.port),
+                cfg.allow_lan_access,
+                cfg.auth_mode.clone(),
+                security.effective_auth_mode(),
+                cfg.enable_logging,
+                ProviderFlags {
+                    zai_enabled: cfg.zai.enabled,
+                    zai_dispatch_mode: cfg.zai.dispatch_mode.clone(),
+                    zai_mcp_enabled: cfg.zai.mcp.enabled,
+                },
+                instance.token_manager.len(),
+            )
+        } else {
+            (
+                false,
+                0,
+                String::new(),
+                false,
+                crate::proxy::config::ProxyAuthMode::Off,
+                crate::proxy::config::ProxyAuthMode::Off,
+                false,
+                ProviderFlags {
+                    zai_enabled: false,
+                    zai_dispatch_mode: crate::proxy::ZaiDispatchMode::Off,
+                    zai_mcp_enabled: false,
+                },
+                0,
+            )
+        };
+
+    let limit = limit.unwrap_or(200);
+
+    let recent_logs: Vec<ProxyRequestLog> = {
+        let monitor_lock = state.monitor.read().await;
+        if let Some(monitor) = monitor_lock.as_ref() {
+            monitor.get_logs(limit).await
+        } else {
+            Vec::new()
+        }
+    };
+
+    let mut recent = Vec::with_capacity(recent_logs.len());
+    let mut per_provider_map: std::collections::HashMap<String, ProviderAggregate> = std::collections::HashMap::new();
+    let mut per_account_map: std::collections::HashMap<(String, Option<String>, Option<String>), AccountAggregate> = std::collections::HashMap::new();
+
+    for l in recent_logs {
+        let provider = l.provider.clone();
+        let provider_key = provider.clone().unwrap_or_else(|| "unknown".to_string());
+        let is_error = l.status < 200 || l.status >= 400;
+        let input_tokens = l.input_tokens.unwrap_or(0) as u64;
+        let output_tokens = l.output_tokens.unwrap_or(0) as u64;
+
+        recent.push(ProxyAttributionEvent {
+            id: l.id.clone(),
+            timestamp: l.timestamp,
+            method: l.method.clone(),
+            path: l.url.clone(),
+            status: l.status,
+            duration: l.duration,
+            provider: provider.clone(),
+            resolved_model: l.resolved_model.clone().or(l.model.clone()),
+            account_id: l.account_id.clone(),
+            account_email_masked: l.account_email_masked.clone(),
+            input_tokens: l.input_tokens,
+            output_tokens: l.output_tokens,
+        });
+
+        let p = per_provider_map.entry(provider_key.clone()).or_insert_with(|| ProviderAggregate {
+            provider: provider_key.clone(),
+            ..ProviderAggregate::default()
+        });
+        p.requests += 1;
+        if is_error {
+            p.errors += 1;
+        }
+        p.input_tokens += input_tokens;
+        p.output_tokens += output_tokens;
+        p.last_seen = Some(p.last_seen.map(|v| v.max(l.timestamp)).unwrap_or(l.timestamp));
+
+        let account_key = (provider_key.clone(), l.account_id.clone(), l.account_email_masked.clone());
+        let a = per_account_map.entry(account_key.clone()).or_insert_with(|| AccountAggregate {
+            provider: provider_key.clone(),
+            account_id: account_key.1.clone(),
+            account_email_masked: account_key.2.clone(),
+            ..AccountAggregate::default()
+        });
+        a.requests += 1;
+        if is_error {
+            a.errors += 1;
+        }
+        a.input_tokens += input_tokens;
+        a.output_tokens += output_tokens;
+        a.last_seen = Some(a.last_seen.map(|v| v.max(l.timestamp)).unwrap_or(l.timestamp));
+    }
+
+    let mut per_provider: Vec<ProviderAggregate> = per_provider_map.into_values().collect();
+    per_provider.sort_by(|a, b| b.last_seen.unwrap_or(0).cmp(&a.last_seen.unwrap_or(0)));
+
+    let mut per_account: Vec<AccountAggregate> = per_account_map.into_values().collect();
+    per_account.sort_by(|a, b| b.last_seen.unwrap_or(0).cmp(&a.last_seen.unwrap_or(0)));
+
+    Ok(ProxyRuntimeStatus {
+        running,
+        port,
+        base_url,
+        allow_lan_access,
+        auth_mode,
+        effective_auth_mode,
+        logging_enabled,
+        providers,
+        pool: PoolRuntimeSummary {
+            active_accounts: pool_active_accounts,
+            lock: None,
+        },
+        recent,
+        per_provider,
+        per_account,
+    })
+}
+
+#[tauri::command]
+pub async fn get_proxy_rate_limits(
+    state: State<'_, ProxyServiceState>,
+) -> Result<Vec<RateLimitStatus>, String> {
+    let instance_lock = state.instance.read().await;
+    let instance = match instance_lock.as_ref() {
+        Some(instance) => instance,
+        None => {
+            tracing::warn!("Backend Command: get_proxy_rate_limits called but proxy service is not running");
+            return Err("服务未运行".to_string());
+        }
+    };
+
+    let now = SystemTime::now();
+    let snapshot = instance.token_manager.get_rate_limit_snapshot();
+    let mut grouped: std::collections::HashMap<String, Vec<(String, RateLimitInfo)>> = std::collections::HashMap::new();
+
+    for (key, info) in snapshot {
+        let remaining = match info.reset_time.duration_since(now) {
+            Ok(duration) => duration.as_secs(),
+            Err(_) => 0,
+        };
+        if remaining == 0 {
+            continue;
+        }
+        grouped
+            .entry(key.account_id.clone())
+            .or_default()
+            .push((key.model.clone(), info));
+    }
+
+    let mut out = Vec::with_capacity(grouped.len());
+    for (account_id, mut entries) in grouped {
+        entries.sort_by(|(model_a, info_a), (model_b, info_b)| {
+            let rem_a = info_a
+                .reset_time
+                .duration_since(now)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let rem_b = info_b
+                .reset_time
+                .duration_since(now)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            rem_b.cmp(&rem_a).then_with(|| model_a.cmp(model_b))
+        });
+
+        let (model, info) = entries[0].clone();
+        let remaining = info
+            .reset_time
+            .duration_since(now)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let reset_at = info
+            .reset_time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let models = entries.into_iter().map(|(m, _)| m).collect();
+
+        out.push(RateLimitStatus {
+            account_id,
+            model,
+            models,
+            reason: rate_limit_reason_code(info.reason).to_string(),
+            reset_at,
+            remaining_seconds: remaining,
+        });
+    }
+
+    tracing::debug!(
+        "Backend Command: get_proxy_rate_limits returned {} account(s) with active cooldown",
+        out.len()
+    );
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn clear_proxy_rate_limit(
+    state: State<'_, ProxyServiceState>,
+    account_id: String,
+) -> Result<bool, String> {
+    let instance_lock = state.instance.read().await;
+    let instance = match instance_lock.as_ref() {
+        Some(instance) => instance,
+        None => return Err("服务未运行".to_string()),
+    };
+
+    let cleared = instance.token_manager.clear_rate_limit_entries(&account_id);
+    tracing::info!(
+        "Backend Command: clear_proxy_rate_limit account_id={} cleared_entries={}",
+        account_id,
+        cleared
+    );
+    Ok(cleared > 0)
+}
+
 /// 生成 API Key
 #[tauri::command]
 pub fn generate_api_key() -> String {
@@ -286,6 +605,15 @@ fn join_base_url(base: &str, path: &str) -> String {
         format!("/{}", path)
     };
     format!("{}{}", base, path)
+}
+
+fn rate_limit_reason_code(reason: RateLimitReason) -> &'static str {
+    match reason {
+        RateLimitReason::QuotaExhausted => "quota_exhausted",
+        RateLimitReason::RateLimitExceeded => "rate_limit_exceeded",
+        RateLimitReason::ServerError => "server_error",
+        RateLimitReason::Unknown => "unknown",
+    }
 }
 
 fn extract_model_ids(value: &serde_json::Value) -> Vec<String> {
@@ -430,4 +758,3 @@ pub async fn clear_proxy_session_bindings(
         Err("服务未运行".to_string())
     }
 }
-

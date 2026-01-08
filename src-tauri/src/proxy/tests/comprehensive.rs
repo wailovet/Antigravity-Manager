@@ -15,28 +15,29 @@ mod tests {
     #[test]
     fn test_first_thinking_request_permissive_mode() {
         // 1. 构造一个全新的请求 (无历史消息)
-        let req = ClaudeRequest {
-            model: "claude-3-7-sonnet-20250219".to_string(),
-            messages: vec![
-                Message {
-                    role: "user".to_string(),
-                    content: MessageContent::String("Hello, please think.".to_string()),
-                }
-            ],
-            system: None,
-            tools: None, // 无工具调用
-            stream: false,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            thinking: Some(ThinkingConfig {
-                type_: "enabled".to_string(),
-                budget_tokens: Some(1024),
-            }),
-            metadata: None,
-            output_config: None,
-        };
+	        let req = ClaudeRequest {
+	            model: "claude-3-7-sonnet-20250219".to_string(),
+	            messages: vec![
+	                Message {
+	                    role: "user".to_string(),
+	                    content: MessageContent::String("Hello, please think.".to_string()),
+	                }
+	            ],
+	            system: None,
+	            tools: None, // 无工具调用
+	            stream: false,
+	            max_tokens: None,
+	            stop_sequences: None,
+	            temperature: None,
+	            top_p: None,
+	            top_k: None,
+	            thinking: Some(ThinkingConfig {
+	                type_: "enabled".to_string(),
+	                budget_tokens: Some(1024),
+	            }),
+	            metadata: None,
+	            output_config: None,
+	        };
 
         // 2. 执行转换
         // 如果修复生效，这里应该成功返回，且 thinkingConfig 被保留

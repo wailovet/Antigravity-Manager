@@ -474,6 +474,22 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
     use crate::modules::oauth;
     use crate::error::AppError;
     use reqwest::StatusCode;
+
+    let now = chrono::Utc::now().timestamp();
+    if account.quota.is_none() {
+        if let Some(last_attempt) = account.quota_last_attempt_at {
+            if now.saturating_sub(last_attempt) < 60 {
+                return Err(AppError::Throttled(format!(
+                    "quota refresh throttled; last attempt {}s ago",
+                    now.saturating_sub(last_attempt)
+                )));
+            }
+        }
+    }
+    account.quota_last_attempt_at = Some(now);
+    if let Err(e) = save_account(account) {
+        modules::logger::log_warn(&format!("保存配额尝试时间失败: {}", e));
+    }
     
     // 1. 基于时间的检查 (Time-based check) - 先确保 Token 有效
     let token = match oauth::ensure_fresh_token(&account.token).await {

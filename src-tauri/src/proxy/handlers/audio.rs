@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::proxy::{
     audio::AudioProcessor,
+    common::model_mapping::LOW_QUOTA_THRESHOLD_PERCENT,
     server::AppState,
 };
 
@@ -100,10 +101,17 @@ pub async fn handle_audio_transcription(
 
     // 6. 获取 Token 和上游客户端
     let token_manager = state.token_manager;
-    let (access_token, project_id, email) = token_manager
-        .get_token("text", false, None)
+    let availability = token_manager.model_availability_snapshot();
+    let min_percent = if availability.has_healthy_models {
+        LOW_QUOTA_THRESHOLD_PERCENT
+    } else {
+        0
+    };
+
+    let (access_token, project_id, email, _account_id) = token_manager
+        .get_token("text", false, None, Some(&model), min_percent)
         .await
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
 
     info!("使用账号: {}", email);
 
