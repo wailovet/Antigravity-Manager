@@ -38,22 +38,33 @@ print_info "当前分支: $current_branch"
 
 # 检查是否提供了上游仓库URL
 if [ $# -eq 0 ]; then
-    print_warning "未提供上游仓库URL，将使用当前远程仓库作为上游"
-    # 获取当前的远程仓库URL
-    origin_url=$(git remote get-url origin 2>/dev/null)
-    if [ -z "$origin_url" ]; then
-        print_error "无法获取origin远程仓库URL"
-        exit 1
-    fi
-    print_info "当前origin仓库URL: $origin_url"
+    print_warning "未提供上游仓库URL，将尝试使用已配置的upstream或当前origin作为上游"
     
-    # 询问用户是否设置新的上游仓库
-    read -p "是否要设置新的上游仓库URL? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        read -p "请输入上游仓库URL: " upstream_url
+    # 检查是否已经设置了upstream远程
+    if git remote get-url upstream > /dev/null 2>&1; then
+        upstream_url=$(git remote get-url upstream)
+        print_info "使用已配置的upstream远程仓库URL: $upstream_url"
     else
-        upstream_url=$origin_url
+        # 获取当前的远程仓库URL作为upstream
+        origin_url=$(git remote get-url origin 2>/dev/null)
+        if [ -z "$origin_url" ]; then
+            print_error "无法获取origin远程仓库URL，也未配置upstream"
+            exit 1
+        fi
+        print_info "当前origin仓库URL: $origin_url"
+        
+        # 询问用户是否设置origin作为upstream
+        read -p "是否要将origin设置为upstream? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            upstream_url=$origin_url
+        else
+            read -p "请输入上游仓库URL: " upstream_url
+            if [ -z "$upstream_url" ]; then
+                print_error "上游仓库URL不能为空"
+                exit 1
+            fi
+        fi
     fi
 else
     upstream_url=$1
@@ -65,20 +76,24 @@ if [ -z "$upstream_url" ]; then
     exit 1
 fi
 
-# 检查是否已经设置了upstream远程
+# 检查是否已经设置了upstream远程，如果没有则添加
 if git remote get-url upstream > /dev/null 2>&1; then
     current_upstream_url=$(git remote get-url upstream)
     print_info "当前upstream远程仓库URL: $current_upstream_url"
     
-    # 询问是否要更新上游仓库URL
-    read -p "是否要更新upstream远程仓库URL? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        git remote set-url upstream "$upstream_url"
-        print_success "已更新upstream远程仓库URL为: $upstream_url"
+    # 如果upstream URL不同，则更新
+    if [ "$current_upstream_url" != "$upstream_url" ]; then
+        read -p "是否要更新upstream远程仓库URL? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            git remote set-url upstream "$upstream_url"
+            print_success "已更新upstream远程仓库URL为: $upstream_url"
+        else
+            print_info "继续使用当前upstream远程仓库URL"
+            upstream_url=$current_upstream_url
+        fi
     else
-        print_info "继续使用当前upstream远程仓库URL"
-        upstream_url=$current_upstream_url
+        print_info "upstream远程仓库URL已正确配置"
     fi
 else
     # 添加upstream远程仓库
@@ -120,7 +135,7 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
         fi
     fi
     
-    print_info "将要合并upstream/$upstream_default_branch到当前分支"
+    print_info "将要合并upstream/$upstream_default_branch到当前分支($current_branch)"
     
     # 检查是否有未提交的更改
     if ! git diff-index --quiet HEAD --; then
@@ -135,7 +150,7 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     
     # 执行合并操作
     if git merge "upstream/$upstream_default_branch"; then
-        print_success "成功将upstream/$upstream_default_branch合并到当前分支"
+        print_success "成功将upstream/$upstream_default_branch合并到当前分支($current_branch)"
         
         # 检查是否有合并冲突
         if git status --porcelain | grep -q "^UU\|^AA\|^DD"; then
