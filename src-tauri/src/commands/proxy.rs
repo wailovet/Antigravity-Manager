@@ -459,7 +459,10 @@ pub async fn get_proxy_rate_limits(
     let instance_lock = state.instance.read().await;
     let instance = match instance_lock.as_ref() {
         Some(instance) => instance,
-        None => return Ok(Vec::new()),
+        None => {
+            tracing::warn!("Backend Command: get_proxy_rate_limits called but proxy service is not running");
+            return Err("服务未运行".to_string());
+        }
     };
 
     let now = SystemTime::now();
@@ -519,6 +522,10 @@ pub async fn get_proxy_rate_limits(
         });
     }
 
+    tracing::debug!(
+        "Backend Command: get_proxy_rate_limits returned {} account(s) with active cooldown",
+        out.len()
+    );
     Ok(out)
 }
 
@@ -533,7 +540,13 @@ pub async fn clear_proxy_rate_limit(
         None => return Err("服务未运行".to_string()),
     };
 
-    Ok(instance.token_manager.clear_rate_limit(&account_id))
+    let cleared = instance.token_manager.clear_rate_limit_entries(&account_id);
+    tracing::info!(
+        "Backend Command: clear_proxy_rate_limit account_id={} cleared_entries={}",
+        account_id,
+        cleared
+    );
+    Ok(cleared > 0)
 }
 
 /// 生成 API Key

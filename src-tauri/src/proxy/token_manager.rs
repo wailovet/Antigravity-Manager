@@ -880,11 +880,15 @@ impl TokenManager {
     pub fn cleanup_expired_rate_limits(&self) -> usize {
         self.rate_limit_tracker.cleanup_expired()
     }
+
+    pub fn clear_rate_limit_entries(&self, account_id: &str) -> usize {
+        self.rate_limit_tracker.clear_account(account_id)
+    }
     
     /// 清除指定账号的限流记录
     #[allow(dead_code)]
     pub fn clear_rate_limit(&self, account_id: &str) -> bool {
-        self.rate_limit_tracker.clear_account(account_id) > 0
+        self.clear_rate_limit_entries(account_id) > 0
     }
 
     /// 获取当前限流记录快照
