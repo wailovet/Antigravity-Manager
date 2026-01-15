@@ -10,7 +10,7 @@
 //! - POST /accounts/:id/bind-device  绑定设备指纹
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::modules::{account, logger};
+use crate::modules::{account, logger, proxy_db};
 
 /// HTTP API 服务器默认端口
 pub const DEFAULT_PORT: u16 = 19527;
@@ -176,12 +176,17 @@ struct DeviceProfileResponse {
     mac_machine_id: String,
     dev_device_id: String,
     sqm_id: String,
-    service_machine_id: String,
 }
 
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+#[derive(Serialize)]
+struct LogsResponse {
+    total: u64,
+    logs: Vec<crate::proxy::monitor::ProxyRequestLog>,
 }
 
 // ============================================================================
@@ -201,6 +206,18 @@ struct BindDeviceRequest {
 
 fn default_bind_mode() -> String {
     "generate".to_string()
+}
+
+#[derive(Deserialize)]
+struct LogsRequest {
+    #[serde(default)]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default)]
+    filter: String,
+    #[serde(default)]
+    errors_only: bool,
 }
 
 // ============================================================================
@@ -405,8 +422,25 @@ async fn bind_device(
             mac_machine_id: result.mac_machine_id,
             dev_device_id: result.dev_device_id,
             sqm_id: result.sqm_id,
-            service_machine_id: result.service_machine_id,
         }),
+    }))
+}
+
+/// GET /logs - 获取代理日志
+async fn get_logs(
+    Query(params): Query<LogsRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let limit = if params.limit == 0 { 50 } else { params.limit };
+
+    let total = proxy_db::get_logs_count_filtered(&params.filter, params.errors_only)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+
+    let logs = proxy_db::get_logs_filtered(&params.filter, params.errors_only, limit, params.offset)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+
+    Ok(Json(LogsResponse {
+        total,
+        logs,
     }))
 }
 
@@ -431,6 +465,7 @@ pub async fn start_server(port: u16) -> Result<(), String> {
         .route("/accounts/switch", post(switch_account))
         .route("/accounts/refresh", post(refresh_all_quotas))
         .route("/accounts/{id}/bind-device", post(bind_device))
+        .route("/logs", get(get_logs))
         .layer(cors)
         .with_state(state);
 
