@@ -8,6 +8,28 @@ use crate::proxy::SignatureCache;
 use bytes::Bytes;
 use serde_json::json;
 
+/// [FIX #547] Helper function to coerce string values to boolean
+/// Gemini sometimes sends boolean parameters as strings (e.g., "true", "-n", "false")
+fn coerce_to_bool(value: &serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::Bool(_) => Some(value.clone()), // Already boolean
+        serde_json::Value::String(s) => {
+            let lower = s.to_lowercase();
+            if lower == "true" || lower == "yes" || lower == "1" || lower == "-n" {
+                Some(json!(true))
+            } else if lower == "false" || lower == "no" || lower == "0" {
+                Some(json!(false))
+            } else {
+                None // Unknown string, can't coerce
+            }
+        }
+        serde_json::Value::Number(n) => {
+            Some(json!(n.as_i64().map(|i| i != 0).unwrap_or(false)))
+        }
+        _ => None,
+    }
+}
+
 /// Known parameter remappings for Gemini → Claude compatibility
 /// [FIX] Gemini sometimes uses different parameter names than specified in tool schema
 fn remap_function_call_args(tool_name: &str, args: &mut serde_json::Value) {
@@ -20,6 +42,14 @@ fn remap_function_call_args(tool_name: &str, args: &mut serde_json::Value) {
         // [IMPROVED] Case-insensitive matching for tool names
         match tool_name.to_lowercase().as_str() {
             "grep" => {
+                // [FIX #546] Gemini hallucination: maps parameter description to "description" field
+                if let Some(desc) = obj.remove("description") {
+                    if !obj.contains_key("pattern") {
+                        obj.insert("pattern".to_string(), desc);
+                        tracing::debug!("[Streaming] Remapped Grep: description → pattern");
+                    }
+                }
+
                 // Gemini uses "query", Claude Code expects "pattern"
                 if let Some(query) = obj.remove("query") {
                     if !obj.contains_key("pattern") {
@@ -52,8 +82,41 @@ fn remap_function_call_args(tool_name: &str, args: &mut serde_json::Value) {
                         tracing::debug!("[Streaming] Remapped Grep: default path → \".\"");
                     }
                 }
+
+                // [FIX #547] Handle "-n" parameter sent as string instead of boolean
+                // Gemini sometimes sends Unix-style flags as parameter names
+                if let Some(n_val) = obj.remove("-n") {
+                    if let Some(bool_val) = coerce_to_bool(&n_val) {
+                        // "-n" in grep usually means "line numbers" - map to appropriate param
+                        if !obj.contains_key("lineNumbers") {
+                            obj.insert("lineNumbers".to_string(), bool_val);
+                            tracing::debug!("[Streaming] Remapped Grep: -n → lineNumbers");
+                        }
+                    }
+                }
+
+                // [FIX #547] Coerce all known boolean parameters from string to bool
+                let bool_params = ["ignoreCase", "lineNumbers", "caseSensitive", "regex", "wholeWord"];
+                for param in bool_params {
+                    if let Some(val) = obj.get(param).cloned() {
+                        if val.is_string() {
+                            if let Some(bool_val) = coerce_to_bool(&val) {
+                                obj.insert(param.to_string(), bool_val);
+                                tracing::debug!("[Streaming] Coerced Grep param '{}' from string to bool", param);
+                            }
+                        }
+                    }
+                }
             }
             "glob" => {
+                // [FIX #546] Gemini hallucination: maps parameter description to "description" field
+                if let Some(desc) = obj.remove("description") {
+                    if !obj.contains_key("pattern") {
+                        obj.insert("pattern".to_string(), desc);
+                        tracing::debug!("[Streaming] Remapped Glob: description → pattern");
+                    }
+                }
+
                 // Gemini uses "query", Claude Code expects "pattern"
                 if let Some(query) = obj.remove("query") {
                     if !obj.contains_key("pattern") {
@@ -151,11 +214,22 @@ pub struct StreamingState {
     trailing_signature: Option<String>,
     pub web_search_query: Option<String>,
     pub grounding_chunks: Option<Vec<serde_json::Value>>,
-    // [IMPROVED] Error recovery 状态追踪
+    // [IMPROVED] Error recovery 状态追踪 (prepared for future use)
+    #[allow(dead_code)]
     parse_error_count: usize,
+    #[allow(dead_code)]
     last_valid_state: Option<BlockType>,
     // [NEW] Model tracking for signature cache
     pub model_name: Option<String>,
+    // [NEW v3.3.17] Session ID for session-based signature caching
+    pub session_id: Option<String>,
+    // [NEW] Flag for context usage scaling
+    pub scaling_enabled: bool,
+    // [NEW] Context limit for smart threshold recovery (default to 1M)
+    pub context_limit: u32,
+    // [NEW] MCP XML Bridge 缓冲区
+    pub mcp_xml_buffer: String,
+    pub in_mcp_xml: bool,
 }
 
 impl StreamingState {
@@ -174,6 +248,11 @@ impl StreamingState {
             parse_error_count: 0,
             last_valid_state: None,
             model_name: None,
+            session_id: None,
+            scaling_enabled: false,
+            context_limit: 1_048_576, // Default to 1M
+            mcp_xml_buffer: String::new(),
+            in_mcp_xml: false,
         }
     }
 
@@ -196,7 +275,7 @@ impl StreamingState {
         let usage = raw_json
             .get("usageMetadata")
             .and_then(|u| serde_json::from_value::<UsageMetadata>(u.clone()).ok())
-            .map(|u| to_claude_usage(&u));
+            .map(|u| to_claude_usage(&u, self.scaling_enabled, self.context_limit));
 
         let mut message = json!({
             "id": raw_json.get("responseId")
@@ -390,7 +469,7 @@ impl StreamingState {
         };
 
         let usage = usage_metadata
-            .map(|u| to_claude_usage(u))
+            .map(|u| to_claude_usage(u, self.scaling_enabled, self.context_limit))
             .unwrap_or(Usage {
                 input_tokens: 0,
                 output_tokens: 0,
@@ -454,6 +533,7 @@ impl StreamingState {
     /// 1. 安全关闭当前 block
     /// 2. 递增错误计数器
     /// 3. 在 debug 模式下输出错误信息
+    #[allow(dead_code)] // Prepared for future error recovery implementation
     pub fn handle_parse_error(&mut self, raw_data: &str) -> Vec<Bytes> {
         let mut chunks = Vec::new();
 
@@ -483,19 +563,24 @@ impl StreamingState {
         }
 
         // 错误率过高时发出警告并尝试发送错误信号
-        if self.parse_error_count > 5 {
+        if self.parse_error_count > 3 {  // 降低阈值,更早通知用户
             tracing::error!(
                 "[SSE-Parser] High error rate detected ({} errors). Stream may be corrupted.",
                 self.parse_error_count
             );
             
             // [FIX] Explicitly signal error to client to prevent UI freeze
-            // Using "overloaded_error" type to suggest retry
+            // Using "network_error" type to suggest network/proxy issues
             chunks.push(self.emit("error", json!({
                 "type": "error",
                 "error": {
-                    "type": "overloaded_error",
-                    "message": "Stream connection unstable (too many parse errors). Please retry."
+                    "type": "network_error",
+                    "message": "网络连接不稳定,请检查您的网络或代理设置。",
+                    "code": "stream_decode_error",
+                    "details": {
+                        "error_count": self.parse_error_count,
+                        "suggestion": "请尝试: 1) 检查网络连接 2) 更换代理节点 3) 稍后重试"
+                    }
                 }
             })));
         }
@@ -504,12 +589,14 @@ impl StreamingState {
     }
 
     /// 重置错误状态 (recovery 后调用)
+    #[allow(dead_code)]
     pub fn reset_error_state(&mut self) {
         self.parse_error_count = 0;
         self.last_valid_state = None;
     }
 
     /// 获取错误计数 (用于监控)
+    #[allow(dead_code)]
     pub fn get_error_count(&self) -> usize {
         self.parse_error_count
     }
@@ -528,7 +615,23 @@ impl<'a> PartProcessor<'a> {
     /// 处理单个 part
     pub fn process(&mut self, part: &GeminiPart) -> Vec<Bytes> {
         let mut chunks = Vec::new();
-        let signature = part.thought_signature.clone();
+        // [FIX #545] Decode Base64 signature if present (Gemini sends Base64, Claude expects Raw)
+        let signature = part.thought_signature.as_ref().map(|sig| {
+             // Try to decode as base64
+             use base64::Engine;
+             match base64::engine::general_purpose::STANDARD.decode(sig) {
+                 Ok(decoded_bytes) => {
+                     match String::from_utf8(decoded_bytes) {
+                         Ok(decoded_str) => {
+                             tracing::debug!("[Streaming] Decoded base64 signature (len {} -> {})", sig.len(), decoded_str.len());
+                             decoded_str
+                         },
+                         Err(_) => sig.clone() // Not valid UTF-8, keep as is
+                     }
+                 },
+                 Err(_) => sig.clone() // Not base64, keep as is
+             }
+        });
 
         // 1. FunctionCall 处理
         if let Some(fc) = &part.function_call {
@@ -634,6 +737,16 @@ impl<'a> PartProcessor<'a> {
                  SignatureCache::global().cache_thinking_family(sig.clone(), model.clone());
             }
             
+            // 2. [NEW v3.3.17] Cache to session-based storage for tool loop recovery
+            if let Some(session_id) = &self.state.session_id {
+                SignatureCache::global().cache_session_signature(session_id, sig.clone());
+                tracing::debug!(
+                    "[Claude-SSE] Cached signature to session {} (length: {})",
+                    session_id,
+                    sig.len()
+                );
+            }
+            
             tracing::debug!(
                 "[Claude-SSE] Captured thought_signature from thinking block (length: {})",
                 sig.len()
@@ -714,7 +827,68 @@ impl<'a> PartProcessor<'a> {
             return chunks;
         }
 
-        // 普通 text (无签名)
+        // Ordinary text (without signature)
+        
+        // [NEW] MCP XML Bridge: Intercept and parse <mcp__...> tags
+        if text.contains("<mcp__") || self.state.in_mcp_xml {
+            self.state.in_mcp_xml = true;
+            self.state.mcp_xml_buffer.push_str(text);
+            
+            // Check if we have a complete tag in the buffer
+            if self.state.mcp_xml_buffer.contains("</mcp__") && self.state.mcp_xml_buffer.contains('>') {
+                let buffer = self.state.mcp_xml_buffer.clone();
+                if let Some(start_idx) = buffer.find("<mcp__") {
+                    if let Some(tag_end_idx) = buffer[start_idx..].find('>') {
+                        let actual_tag_end = start_idx + tag_end_idx;
+                        let tool_name = &buffer[start_idx + 1..actual_tag_end];
+                        let end_tag = format!("</{}>", tool_name);
+                        
+                        if let Some(close_idx) = buffer.find(&end_tag) {
+                            let input_str = &buffer[actual_tag_end + 1..close_idx];
+                            let input_json: serde_json::Value = serde_json::from_str(input_str.trim())
+                                .unwrap_or_else(|_| json!({ "input": input_str.trim() }));
+                            
+                            // 构造并发送 tool_use
+                            let fc = FunctionCall {
+                                name: tool_name.to_string(),
+                                args: Some(input_json),
+                                id: Some(format!("{}-xml", tool_name)),
+                            };
+                            
+                            let tool_chunks = self.process_function_call(&fc, None);
+                            
+                            // 清理缓冲区并重置状态
+                            self.state.mcp_xml_buffer.clear();
+                            self.state.in_mcp_xml = false;
+                            
+                            // 处理标签之前可能存在的非 XML 文本
+                            if start_idx > 0 {
+                                let prefix_text = &buffer[..start_idx];
+                                // 这里不能递归。直接 emit 之前的 text 块。
+                                if self.state.current_block_type() != BlockType::Text {
+                                    chunks.extend(self.state.start_block(BlockType::Text, json!({ "type": "text", "text": "" })));
+                                }
+                                chunks.push(self.state.emit_delta("text_delta", json!({ "text": prefix_text })));
+                            }
+                            
+                            chunks.extend(tool_chunks);
+
+                            // 处理标签之后可能存在的非 XML 文本
+                            let suffix = &buffer[close_idx + end_tag.len()..];
+                            if !suffix.is_empty() {
+                                // 递归处理后缀内容
+                                chunks.extend(self.process_text(suffix, None));
+                            }
+                            
+                            return chunks;
+                        }
+                    }
+                }
+            }
+            // While in XML, don't emit text deltas
+            return vec![];
+        }
+
         if self.state.current_block_type() != BlockType::Text {
             chunks.extend(
                 self.state
@@ -758,6 +932,11 @@ impl<'a> PartProcessor<'a> {
             
             // 2. Cache tool signature (Layer 1 recovery)
             SignatureCache::global().cache_tool_signature(&tool_id, sig.clone());
+            
+            // 3. [NEW v3.3.17] Cache to session-based storage
+            if let Some(session_id) = &self.state.session_id {
+                SignatureCache::global().cache_session_signature(session_id, sig.clone());
+            }
             
              tracing::debug!(
                 "[Claude-SSE] Captured thought_signature for function call (length: {})",

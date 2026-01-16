@@ -1,12 +1,14 @@
 {
     "common": {
         "loading": "加载中...",
+        "load_more": "加载更多",
         "add": "添加",
         "action": "操作",
         "save": "保存",
         "saved": "保存成功",
         "cancel": "取消",
         "confirm": "确认",
+        "close": "关闭",
         "delete": "删除",
         "edit": "编辑",
         "refresh": "刷新",
@@ -40,8 +42,20 @@
         "theme_to_light": "切换到浅色模式",
         "switch_to_english": "切换到英文",
         "switch_to_chinese": "切换到中文",
+        "switch_to_traditional_chinese": "切换到繁体中文",
         "switch_to_english_short": "EN",
-        "switch_to_chinese_short": "中"
+        "switch_to_chinese_short": "ZH",
+        "switch_to_traditional_chinese_short": "TW",
+        "switch_to_japanese": "切换到日文",
+        "switch_to_japanese_short": "JA",
+        "switch_to_turkish": "切换到土耳其文",
+        "switch_to_turkish_short": "TR",
+        "switch_to_vietnamese": "切换到越南文",
+        "switch_to_vietnamese_short": "VI",
+        "switch_to_russian": "切换到俄文",
+        "switch_to_russian_short": "RU",
+        "switch_to_portuguese": "切换到葡萄牙文",
+        "switch_to_portuguese_short": "PT"
     },
     "dashboard": {
         "hello": "你好, 用户 👋",
@@ -88,6 +102,11 @@
         "refresh_all": "刷新所有",
         "refresh_selected": "刷新 ({{count}})",
         "export_selected": "导出 ({{count}})",
+        "import_json": "导入",
+        "import_success": "成功导入 {{count}} 个账号",
+        "import_partial": "导入完成: {{success}} 个成功, {{fail}} 个失败",
+        "import_fail": "导入失败: {{error}}",
+        "import_invalid_format": "无效的 JSON 格式，请确保文件包含 email 和 refresh_token 字段",
         "delete_selected": "删除 ({{count}})",
         "current": "当前",
         "current_badge": "当前",
@@ -110,6 +129,12 @@
         "reset_time": "重置时间",
         "switch_to": "切换到此账号",
         "actions": "操作",
+        "device_fingerprint": "设备指纹",
+        "warmup_all": "一键预热",
+        "warmup_selected": "预热 ({{count}})",
+        "warmup_this": "预热该账号",
+        "warmup_now": "立即预热",
+        "warmup_batch_triggered": "已成功为 {{count}} 个账号触发预热任务",
         "details": {
             "title": "配额详情"
         },
@@ -190,7 +215,11 @@
             "disable_proxy_title": "禁用反代",
             "disable_proxy_msg": "确定要禁用此账号的反代功能吗？账号仍可在应用中使用。",
             "enable_proxy_title": "启用反代",
-            "enable_proxy_msg": "确定要重新启用此账号的反代功能吗？"
+            "enable_proxy_msg": "确定要重新启用此账号的反代功能吗？",
+            "warmup_all_title": "全量手动预热",
+            "warmup_all_msg": "确定要立即为所有符合条件的账号触发预热任务吗？这将向 Google 服务发送极小流量以重置配额配额周期。",
+            "batch_warmup_title": "批量手动预热",
+            "batch_warmup_msg": "确定要为选中的 {{count}} 个账号立即触发预热吗？"
         }
     },
     "settings": {
@@ -212,16 +241,39 @@
             "auto_launch": "开机自动启动",
             "auto_launch_enabled": "启用",
             "auto_launch_disabled": "禁用",
-            "auto_launch_desc": "系统启动时自动运行 Antigravity Tools"
+            "auto_launch_desc": "系统启动时自动运行 Antigravity Tools",
+            "auto_check_update": "自动检查更新",
+            "auto_check_update_desc": "启动时自动检查新版本",
+            "auto_check_update_enabled": "已启用自动检查更新",
+            "auto_check_update_disabled": "已禁用自动检查更新",
+            "update_check_interval": "检查间隔(小时)",
+            "update_check_interval_desc": "设置自动检查更新的时间间隔(1-168 小时)",
+            "update_check_interval_saved": "已保存检查间隔设置"
         },
         "account": {
             "title": "账号设置",
-            "auto_refresh": "自动刷新配额",
-            "auto_refresh_desc": "定期自动刷新所有账号的配额信息",
+            "auto_refresh": "后台自动刷新",
+            "auto_refresh_desc": "后台自动刷新所有账号的配额信息，这是额度保护和智能预热的基础。",
+            "always_on": "始终开启",
             "refresh_interval": "刷新间隔（分钟）",
             "auto_sync": "自动获取当前账号",
-            "auto_sync_desc": "定期自动同步当前活跃账号信息",
+            "auto_sync_desc": "定期自动刷新当前活动账号的信息",
             "sync_interval": "同步间隔（秒）"
+        },
+        "warmup": {
+            "title": "智能预热",
+            "desc": "自动监控所有模型，当额度恢复到 100% 时立即触发预热，保持模型热状态"
+        },
+        "quota_protection": {
+            "title": "配额保护",
+            "enable": "启用配额保护",
+            "enable_desc": "当账号剩余配额低于阈值时自动禁用反代功能，配额重置后将自动恢复账号",
+            "threshold_label": "保留配额百分比",
+            "monitored_models_label": "监控模型 (触发条件)",
+            "monitored_models_desc": "至少选择一个核心模型。任一勾选模型额度低于阈值将触发保护",
+            "range": "范围",
+            "example": "示例：设置 {{percentage}}% 时，{{total}} 次配额的账号剩余 ≤ {{threshold}} 次时将被自动禁用",
+            "auto_restore_info": "配额重置后将自动重新启用账号"
         },
         "proxy": {
             "title": "代理设置"
@@ -255,7 +307,17 @@
             "clear_logs": "清理日志缓存",
             "clear_logs_title": "清理日志确认",
             "clear_logs_msg": "确定要清理所有日志缓存文件吗？",
-            "logs_cleared": "日志缓存已清理"
+            "logs_cleared": "日志缓存已清理",
+            "http_api_title": "HTTP API 服务",
+            "http_api_desc": "为外部程序（如 VS Code 插件）提供本地 HTTP 接口。",
+            "http_api_enabled": "启用 HTTP API",
+            "http_api_enabled_desc": "启用后，外部程序可通过 HTTP 接口管理账号",
+            "http_api_port": "监听端口",
+            "http_api_port_desc": "修改端口后需要重启应用才能生效。如遇端口冲突，请更换为其他未被占用的端口。",
+            "http_api_port_placeholder": "默认端口 19527",
+            "http_api_port_invalid": "端口号无效（范围：1024-65535）",
+            "http_api_settings_saved": "HTTP API 设置已保存，重启应用后生效",
+            "http_api_restart_required": "⚠️ 需要重启应用后生效"
         },
         "about": {
             "title": "关于",
@@ -271,7 +333,13 @@
             "latest_version": "已是最新版本",
             "new_version_available": "发现新版本 {{version}}",
             "download_update": "前往下载",
-            "update_check_failed": "检测更新失败"
+            "update_check_failed": "检测更新失败",
+            "support_btn": "支持作者",
+            "support_title": "赞助支持",
+            "support_desc": "如果您觉得本工具对您有帮助，欢迎扫码请作者喝杯咖啡！您的支持是我持续维护项目的最大动力。",
+            "support_alipay": "支付宝",
+            "support_wechat": "微信支付",
+            "support_buymeacoffee": "Buy Me a Coffee"
         }
     },
     "tray": {
@@ -313,9 +381,13 @@
             "api_key": "API 密钥",
             "api_key_tooltip": "启用鉴权后，客户端访问代理所需的共享密钥。重新生成会立即使旧密钥失效。",
             "btn_regenerate": "重新生成密钥",
+            "btn_edit": "编辑",
+            "btn_save": "保存",
             "btn_copy": "复制",
             "btn_copied": "已复制",
             "warning_key": "注意：请妥善保管您的 API 密钥，不要泄露给他人。",
+            "api_key_invalid": "API 密钥格式无效,必须以 sk- 开头且长度至少 10 个字符",
+            "api_key_updated": "API 密钥已更新",
             "auth": {
                 "title": "访问授权",
                 "title_tooltip": "控制代理是否需要鉴权，以及哪些路由需要提供 API 密钥。",
@@ -391,7 +463,7 @@
             },
             "request_timeout": "请求超时",
             "request_timeout_tooltip": "代理等待上游响应的最大时间（秒），包含流式输出。长文本/长推理可适当调大；修改后需重启生效。",
-            "request_timeout_hint": "默认 120 秒，范围 30-600 秒。修改后需重启服务生效。",
+            "request_timeout_hint": "默认 120 秒，范围 30-3600 秒。修改后需重启服务生效。",
             "enable_logging": "启用请求日志",
             "enable_logging_hint": "记录历史记录以便调试 (微小性能损耗)",
             "upstream_proxy": {
@@ -422,6 +494,12 @@
                 "max_wait_tooltip": "仅在“缓存优先”模式下生效：如果账号限流重置时间小于此值，则原地等待而非切换账号。",
                 "clear_bindings": "清除会话绑定",
                 "clear_bindings_tooltip": "立即断开所有会话与账号的绑定关系，强制下一次请求重新分配账号。"
+            },
+            "experimental": {
+                "title": "实验性设置 (Experimental)",
+                "title_tooltip": "探索性功能，可能在未来版本中调整或移除。",
+                "enable_usage_scaling": "启用用量缩放",
+                "enable_usage_scaling_tooltip": "针对 Claude 兼容协议。当总输入超过 30k Token 时开启激进缩放，防止在大上下文下频繁触发客户端压缩。注意：开启后客户端显示的用量不再代表实际计费点数。"
             }
         },
         "example": {
@@ -484,7 +562,11 @@
         },
         "router": {
             "title": "模型路由中心 (Model Router)",
-            "subtitle": "按“规格家族”统一路由 OpenAI/Claude 模型，或添加最高优先级的“精确映射”。",
+            "subtitle": "按“规格家族”统一路由 OpenAI/Claude 模型，或添加最高优先级的“精确映射”。\n注意：Claude 原生直通模型（claude-opus-4-5-thinking 等 3 个）默认透传，需在“专家精确映射”中添加规则才能修改。",
+            "subtitle_simple": "通过通配符或精确映射自定义模型路由规则",
+            "apply_presets": "应用预设映射",
+            "presets_applied": "预设映射已应用",
+            "custom_mappings": "自定义映射 (Custom Mappings)",
             "original_id": "原始模型 ID",
             "route_to": "路由目标",
             "group_title": "模型家族分组 (Series Groups)",
@@ -516,6 +598,9 @@
             },
             "expert_title": "专家精确映射 (Expert Custom Routing)",
             "expert_subtitle": "精确匹配支持从任何协议传来的原始模型 ID。",
+            "money_saving_tip": "💰 省钱提示:",
+            "haiku_optimization_tip": "Claude CLI 默认使用 {{model}} 处理后台任务,建议映射到廉价 Flash 模型可节省约 95% 成本",
+            "haiku_optimization_btn": "一键优化",
             "haiku_tip_title": "💰 省钱提示:",
             "haiku_tip_body_before": "Claude CLI 默认使用",
             "haiku_tip_body_after": "处理后台任务,建议映射到廉价 Flash 模型可节省约 95% 成本",
@@ -526,7 +611,8 @@
             "current_list": "当前映射列表 (Custom List)",
             "no_custom_mapping": "暂无自定义精确映射",
             "gemini3_only_warning": "⚠️ 仅支持 Gemini 3 系列",
-            "default_suffix": "（默认）"
+            "default_suffix": "（默认）",
+            "select_target_model": "选择目标模型"
         },
         "examples": {
             "title": "使用示例"
@@ -580,6 +666,7 @@
             "status": "状态",
             "method": "方法",
             "model": "模型",
+            "account": "账号",
             "path": "路径",
             "usage": "Token 消耗",
             "duration": "耗时",
@@ -599,6 +686,20 @@
         "dialog": {
             "clear_title": "清除监控日志",
             "clear_msg": "确定要清除所有监控记录吗？此操作无法撤销。"
+        }
+    },
+    "update_notification": {
+        "title": "发现新版本",
+        "message": "新版本已准备就绪，包含多项优化与改进。当前版本: v{{current}}",
+        "action": "立即更新"
+    },
+    "errors": {
+        "stream": {
+            "timeout_error": "请求超时,请检查网络连接",
+            "connection_error": "无法连接到服务器,请检查网络或代理设置",
+            "decode_error": "网络连接不稳定,数据传输中断。建议: 1) 检查网络连接 2) 更换代理节点 3) 稍后重试",
+            "stream_error": "数据流传输错误,请稍后重试",
+            "unknown_error": "发生未知错误,请稍后重试"
         }
     }
 }

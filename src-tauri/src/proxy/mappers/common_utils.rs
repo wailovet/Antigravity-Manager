@@ -63,6 +63,15 @@ pub fn resolve_request_config(
     // but if searching, we MUST ensure the model name is one the backend associates with search.
     // Force a stable search model for search requests.
     let mut final_model = mapped_model.trim_end_matches("-online").to_string();
+    
+    // [FIX] Map logic aliases back to physical model names for upstream compatibility
+    final_model = match final_model.as_str() {
+        "gemini-3-pro-preview" => "gemini-3-pro-high".to_string(), // Preview maps back to High
+        "gemini-3-pro-image-preview" => "gemini-3-pro-image".to_string(),
+        "gemini-3-flash-preview" => "gemini-3-flash".to_string(),
+        _ => final_model
+    };
+
     if enable_networking {
         // [FIX] Only gemini-2.5-flash supports googleSearch tool
         // All other models (including Gemini 3 Pro, thinking models, Claude aliases) must downgrade
@@ -290,7 +299,7 @@ mod tests {
         let config = resolve_request_config("gemini-3-flash-online", "gemini-3-flash", &None);
         assert_eq!(config.request_type, "web_search");
         assert!(config.inject_google_search);
-        assert_eq!(config.final_model, "gemini-3-flash");
+        assert_eq!(config.final_model, "gemini-2.5-flash");
     }
 
     #[test]

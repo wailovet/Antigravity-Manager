@@ -322,24 +322,7 @@ pub async fn handle_messages(
     let zai_enabled = zai.enabled && !matches!(zai.dispatch_mode, crate::proxy::ZaiDispatchMode::Off);
     let google_accounts = state.token_manager.len();
 
-    let use_zai = if !zai_enabled {
-        false
-    } else {
-        match zai.dispatch_mode {
-            crate::proxy::ZaiDispatchMode::Off => false,
-            crate::proxy::ZaiDispatchMode::Exclusive => true,
-            crate::proxy::ZaiDispatchMode::Fallback => google_accounts == 0,
-            crate::proxy::ZaiDispatchMode::Pooled => {
-                // Treat z.ai as exactly one extra slot in the pool.
-                // No strict guarantees: it may get 0 requests if selection never hits.
-                let total = google_accounts.saturating_add(1).max(1);
-                let slot = state.provider_rr.fetch_add(1, Ordering::Relaxed) % total;
-                slot == 0
-            }
-        }
-    };
-
-    // [CRITICAL REFACTOR] 优先解析并过滤 Thinking 块，确保 z.ai 也是用修复后的 Body
+    // [CRITICAL REFACTOR] 优先解析请求以获取模型信息(用于智能兜底判断)
     let mut request: crate::proxy::mappers::claude::models::ClaudeRequest = match serde_json::from_value(body) {
         Ok(r) => r,
         Err(e) => {
@@ -356,6 +339,44 @@ pub async fn handle_messages(
         }
     };
 
+    // [Issue #703 Fix] 智能兜底判断:需要归一化模型名用于配额保护检查
+    let normalized_model = crate::proxy::common::model_mapping::normalize_to_standard_id(&request.model)
+        .unwrap_or_else(|| request.model.clone());
+
+    let use_zai = if !zai_enabled {
+        false
+    } else {
+        match zai.dispatch_mode {
+            crate::proxy::ZaiDispatchMode::Off => false,
+            crate::proxy::ZaiDispatchMode::Exclusive => true,
+            crate::proxy::ZaiDispatchMode::Fallback => {
+                if google_accounts == 0 {
+                    // 没有 Google 账号,使用兜底
+                    tracing::info!("[{}] No Google accounts available, using fallback provider", trace_id);
+                    true
+                } else {
+                    // [Issue #703 Fix] 智能判断:检查是否有可用的 Google 账号
+                    let has_available = state.token_manager.has_available_account("claude", &normalized_model).await;
+                    if !has_available {
+                        tracing::info!(
+                            "[{}] All Google accounts unavailable (rate-limited or quota-protected for {}), using fallback provider",
+                            trace_id,
+                            request.model
+                        );
+                    }
+                    !has_available
+                }
+            }
+            crate::proxy::ZaiDispatchMode::Pooled => {
+                // Treat z.ai as exactly one extra slot in the pool.
+                // No strict guarantees: it may get 0 requests if selection never hits.
+                let total = google_accounts.saturating_add(1).max(1);
+                let slot = state.provider_rr.fetch_add(1, Ordering::Relaxed) % total;
+                slot == 0
+            }
+        }
+    };
+
     // [CRITICAL FIX] 过滤并修复 Thinking 块签名
     filter_invalid_thinking_blocks(&mut request.messages);
 
@@ -363,6 +384,17 @@ pub async fn handle_messages(
     // This prevents "Assistant message must start with thinking" errors by closing the loop with synthetic messages
     if state.experimental.read().await.enable_tool_loop_recovery {
         close_tool_loop_for_thinking(&mut request.messages);
+    }
+
+    // ===== [Issue #467 Fix] 拦截 Claude Code Warmup 请求 =====
+    // Claude Code 会每 10 秒发送一次 warmup 请求来保持连接热身，
+    // 这些请求会消耗大量配额。检测到 warmup 请求后直接返回模拟响应。
+    if is_warmup_request(&request) {
+        tracing::info!(
+            "[{}] 🔥 拦截 Warmup 请求，返回模拟响应（节省配额）",
+            trace_id
+        );
+        return create_warmup_response(&request, request.stream);
     }
 
     if use_zai {
@@ -387,6 +419,9 @@ pub async fn handle_messages(
     
     // Google Flow 继续使用 request 对象
     // (后续代码不需要再次 filter_invalid_thinking_blocks)
+    
+    // [NEW] 获取上下文缩放配置
+    let scaling_enabled = state.experimental.read().await.enable_usage_scaling;
 
     // 获取最新一条“有意义”的消息内容（用于日志记录和后台任务检测）
     // 策略：反向遍历，首先筛选出所有角色为 "user" 的消息，然后从中找到第一条非 "Warmup" 且非空的文本消息
@@ -460,8 +495,11 @@ pub async fn handle_messages(
     for (idx, msg) in request.messages.iter().enumerate() {
         let content_preview = match &msg.content {
             crate::proxy::mappers::claude::models::MessageContent::String(s) => {
-                if s.len() > 200 {
-                    format!("{}... (total {} chars)", &s[..200], s.len())
+                let char_count = s.chars().count();
+                if char_count > 200 {
+                    // 【修复】使用 chars().take() 安全截取，避免 UTF-8 字符边界 panic
+                    let preview: String = s.chars().take(200).collect();
+                    format!("{}... (total {} chars)", preview, char_count)
                 } else {
                     s.clone()
                 }
@@ -492,16 +530,13 @@ pub async fn handle_messages(
 
     let mut last_error = String::new();
     let mut retried_without_thinking = false;
+    let mut last_email: Option<String> = None;
     
     for attempt in 0..max_attempts {
-        // 2. 模型路由与配置解析 (提前解析以确定请求类型)
-        // 先不应用家族映射，获取初步的 mapped_model
-        let initial_mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        // 2. 模型路由解析
+        let mut mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
             &request_for_body.model,
             &*state.custom_mapping.read().await,
-            &*state.openai_mapping.read().await,
-            &*state.anthropic_mapping.read().await,
-            false,  // 先不应用家族映射
         );
         
         // 将 Claude 工具转为 Value 数组以便探测联网
@@ -509,26 +544,7 @@ pub async fn handle_messages(
             list.iter().map(|t| serde_json::to_value(t).unwrap_or(json!({}))).collect()
         });
 
-        let config = crate::proxy::mappers::common_utils::resolve_request_config(&request_for_body.model, &initial_mapped_model, &tools_val);
-
-        // 3. 根据 request_type 决定是否应用 Claude 家族映射
-        // request_type == "agent" 表示 CLI 请求，应该应用家族映射
-        // 其他类型（web_search, image_gen）不应用家族映射
-        let is_cli_request = config.request_type == "agent";
-        
-        let mut mapped_model = if is_cli_request {
-            // CLI 请求：重新调用 resolve_model_route，应用家族映射
-            crate::proxy::common::model_mapping::resolve_model_route(
-                &request_for_body.model,
-                &*state.custom_mapping.read().await,
-                &*state.openai_mapping.read().await,
-                &*state.anthropic_mapping.read().await,
-                true,  // CLI 请求应用家族映射
-            )
-        } else {
-            // 非 CLI 请求：使用初步的 mapped_model（已跳过家族映射）
-            initial_mapped_model
-        };
+        let config = crate::proxy::mappers::common_utils::resolve_request_config(&request_for_body.model, &mapped_model, &tools_val);
 
         // 0. 尝试提取 session_id 用于粘性调度 (Phase 2/3)
         // 使用 SessionManager 生成稳定的会话指纹
@@ -536,7 +552,7 @@ pub async fn handle_messages(
         let session_id = Some(session_id_str.as_str());
 
         let force_rotate_token = attempt > 0;
-        let (access_token, project_id, email) = match token_manager.get_token(&config.request_type, force_rotate_token, session_id).await {
+        let (access_token, project_id, email) = match token_manager.get_token(&config.request_type, force_rotate_token, session_id, &config.final_model).await {
             Ok(t) => t,
             Err(e) => {
                 let safe_message = if e.contains("invalid_grant") {
@@ -557,6 +573,7 @@ pub async fn handle_messages(
             }
         };
 
+        last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
         
         
@@ -642,10 +659,18 @@ pub async fn handle_messages(
             }
         };
         
-    // 4. 上游调用
-    let is_stream = request.stream;
-    let method = if is_stream { "streamGenerateContent" } else { "generateContent" };
-    let query = if is_stream { Some("alt=sse") } else { None };
+    // 4. 上游调用 - 自动转换逻辑
+    let client_wants_stream = request.stream;
+    // [AUTO-CONVERSION] 非 Stream 请求自动转换为 Stream 以享受更宽松的配额
+    let force_stream_internally = !client_wants_stream;
+    let actual_stream = client_wants_stream || force_stream_internally;
+    
+    if force_stream_internally {
+        info!("[{}] 🔄 Auto-converting non-stream request to stream for better quota", trace_id);
+    }
+    
+    let method = if actual_stream { "streamGenerateContent" } else { "generateContent" };
+    let query = if actual_stream { Some("alt=sse") } else { None };
 
     let response = match upstream.call_v1_internal(
         method,
@@ -665,29 +690,92 @@ pub async fn handle_messages(
         
         // 成功
         if status.is_success() {
+            // [智能限流] 请求成功，重置该账号的连续失败计数
+            token_manager.mark_account_success(&email);
+            
+                // Determine context limit based on model
+                let context_limit = crate::proxy::mappers::claude::utils::get_context_limit_for_model(&request_with_mapped.model);
+
             // 处理流式响应
-            if request.stream {
+            if actual_stream {
                 let stream = response.bytes_stream();
                 let gemini_stream = Box::pin(stream);
-                let claude_stream = create_claude_sse_stream(gemini_stream, trace_id, email.clone());
+                // [v3.3.17] Pass session_id for signature caching
+                let mut claude_stream = create_claude_sse_stream(
+                    gemini_stream, 
+                    trace_id.clone(), 
+                    email.clone(),
+                    Some(session_id_str.clone()),
+                    scaling_enabled,
+                    context_limit
+                );
 
-                // 转换为 Bytes stream
-                let sse_stream = claude_stream.map(|result| -> Result<Bytes, std::io::Error> {
-                    match result {
-                        Ok(bytes) => Ok(bytes),
-                        Err(e) => Ok(Bytes::from(format!("data: {{\"error\":\"{}\"}}\n\n", e))),
+                // [FIX #530/#529] Peek first chunk to detect empty response and allow retry
+                // If the stream is empty or fails immediately, we should retry instead of sending 200 OK + empty body
+                let first_chunk = claude_stream.next().await;
+
+                match first_chunk {
+                    Some(Ok(bytes)) => {
+                        if bytes.is_empty() {
+                            tracing::warn!("[{}] Empty first chunk received, treating as Empty Response and retrying...", trace_id);
+                            last_error = "Empty response stream (0 bytes)".to_string();
+                            continue;
+                        }
+                        
+                        // We have data! Construct the combined stream
+                        let stream_rest = claude_stream;
+                        let combined_stream = Box::pin(futures::stream::once(async move { Ok(bytes) })
+                            .chain(stream_rest.map(|result| -> Result<Bytes, std::io::Error> {
+                                match result {
+                                    Ok(b) => Ok(b),
+                                    Err(e) => Ok(Bytes::from(format!("data: {{\"error\":\"{}\"}}\n\n", e))),
+                                }
+                            })));
+
+                        // 判断客户端期望的格式
+                        if client_wants_stream {
+                            // 客户端本就要 Stream，直接返回 SSE
+                            return Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, "text/event-stream")
+                                .header(header::CACHE_CONTROL, "no-cache")
+                                .header(header::CONNECTION, "keep-alive")
+                                .header("X-Account-Email", &email)
+                                .header("X-Mapped-Model", &request_with_mapped.model)
+                                .body(Body::from_stream(combined_stream))
+                                .unwrap();
+                        } else {
+                            // 客户端要非 Stream，需要收集完整响应并转换为 JSON
+                            use crate::proxy::mappers::claude::collect_stream_to_json;
+                            
+                            match collect_stream_to_json(combined_stream).await {
+                                Ok(full_response) => {
+                                    info!("[{}] ✓ Stream collected and converted to JSON", trace_id);
+                                    return Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header(header::CONTENT_TYPE, "application/json")
+                                        .header("X-Account-Email", &email)
+                                        .header("X-Mapped-Model", &request_with_mapped.model)
+                                        .body(Body::from(serde_json::to_string(&full_response).unwrap()))
+                                        .unwrap();
+                                }
+                                Err(e) => {
+                                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("Stream collection error: {}", e)).into_response();
+                                }
+                            }
+                        }
+                    },
+                    Some(Err(e)) => {
+                        tracing::warn!("[{}] Stream error on first chunk: {}, retrying...", trace_id, e);
+                        last_error = format!("Stream error: {}", e);
+                        continue;
+                    },
+                    None => {
+                        tracing::warn!("[{}] Stream ended immediately (Empty Response), retrying...", trace_id);
+                        last_error = "Empty response stream (None)".to_string();
+                        continue;
                     }
-                });
-
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .header(header::CACHE_CONTROL, "no-cache")
-                    .header(header::CONNECTION, "keep-alive")
-                    .header("X-Account-Email", &email)
-                    .header("X-Mapped-Model", &request_with_mapped.model)
-                    .body(Body::from_stream(sse_stream))
-                    .unwrap();
+                }
             } else {
                 // 处理非流式响应
                 let bytes = match response.bytes().await {
@@ -714,8 +802,11 @@ pub async fn handle_messages(
                     Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Convert error: {}", e)).into_response(),
                 };
                 
+                // Determine context limit based on model
+                let context_limit = crate::proxy::mappers::claude::utils::get_context_limit_for_model(&request_with_mapped.model);
+
                 // 转换
-                let claude_response = match transform_response(&gemini_response) {
+                let claude_response = match transform_response(&gemini_response, scaling_enabled, context_limit) {
                     Ok(r) => r,
                     Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Transform error: {}", e)).into_response(),
                 };
@@ -749,9 +840,10 @@ pub async fn handle_messages(
         last_error = format!("HTTP {}: {}", status_code, error_text);
         debug!("[{}] Upstream Error Response: {}", trace_id, error_text);
         
-        // 3. 标记限流状态（用于 UI 显示）
+        // 3. 标记限流状态(用于 UI 显示) - 使用异步版本以支持实时配额刷新
+        // 🆕 传入实际使用的模型,实现模型级别限流,避免不同模型配额互相影响
         if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
-            token_manager.mark_rate_limited(&email, status_code, retry_after.as_deref(), &error_text);
+            token_manager.mark_rate_limited_async(&email, status_code, retry_after.as_deref(), &error_text, Some(&request_with_mapped.model)).await;
         }
 
         // 4. 处理 400 错误 (Thinking 签名失效)
@@ -768,6 +860,7 @@ pub async fn handle_messages(
                 || error_text.contains("failed to deserialise") // [New] JSON structure issues
                 )
         {
+            // Existing logic for thinking signature...
             retried_without_thinking = true;
             
             // 使用 WARN 级别,因为这不应该经常发生(已经主动过滤过)
@@ -825,19 +918,46 @@ pub async fn handle_messages(
             }
             continue;
         } else {
+            // 5. 增强的 400 错误处理: Prompt Too Long 友好提示
+            if status_code == 400 && (error_text.contains("too long") || error_text.contains("exceeds") || error_text.contains("limit")) {
+                 return (
+                    StatusCode::BAD_REQUEST,
+                    [("X-Account-Email", email.as_str())],
+                    Json(json!({
+                        "id": "err_prompt_too_long",
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "Prompt is too long (server-side context limit reached).",
+                            "suggestion": "Please: 1) Executive '/compact' in Claude Code 2) Reduce conversation history 3) Switch to gemini-1.5-pro (2M context limit)"
+                        }
+                    }))
+                ).into_response();
+            }
+
             // 不可重试的错误，直接返回
             error!("[{}] Non-retryable error {}: {}", trace_id, status_code, error_text);
-            return (status, error_text).into_response();
+            return (status, [("X-Account-Email", email.as_str())], error_text).into_response();
         }
     }
     
-    (StatusCode::TOO_MANY_REQUESTS, Json(json!({
-        "type": "error",
-        "error": {
-            "type": "overloaded_error",
-            "message": format!("All {} attempts failed. Last error: {}", max_attempts, last_error)
-        }
-    }))).into_response()
+    if let Some(email) = last_email {
+        (StatusCode::TOO_MANY_REQUESTS, [("X-Account-Email", email)], Json(json!({
+            "type": "error",
+            "error": {
+                "type": "overloaded_error",
+                "message": format!("All {} attempts failed. Last error: {}", max_attempts, last_error)
+            }
+        }))).into_response()
+    } else {
+        (StatusCode::TOO_MANY_REQUESTS, Json(json!({
+            "type": "error",
+            "error": {
+                "type": "overloaded_error",
+                "message": format!("All {} attempts failed. Last error: {}", max_attempts, last_error)
+            }
+        }))).into_response()
+    }
 }
 
 /// 列出可用模型
@@ -845,9 +965,7 @@ pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoRespo
     use crate::proxy::common::model_mapping::get_all_dynamic_models;
 
     let model_ids = get_all_dynamic_models(
-        &state.openai_mapping,
         &state.custom_mapping,
-        &state.anthropic_mapping,
     ).await;
 
     let data: Vec<_> = model_ids.into_iter().map(|id| {
@@ -1050,5 +1168,137 @@ fn select_background_model(task_type: BackgroundTaskType) -> &'static str {
         BackgroundTaskType::PromptSuggestion => BACKGROUND_MODEL_LITE,    // 建议生成
         BackgroundTaskType::EnvironmentProbe => BACKGROUND_MODEL_LITE,    // 环境探测
         BackgroundTaskType::ContextCompression => BACKGROUND_MODEL_STANDARD, // 复杂压缩
+    }
+}
+
+// ===== [Issue #467 Fix] Warmup 请求拦截 =====
+
+/// 检测是否为 Warmup 请求
+/// 
+/// Claude Code 每 10 秒发送一次 warmup 请求，特征包括：
+/// 1. 用户消息内容以 "Warmup" 开头或包含 "Warmup"
+/// 2. tool_result 内容为 "Warmup" 错误
+/// 3. 消息循环模式：助手发送工具调用，用户返回 Warmup 错误
+fn is_warmup_request(request: &ClaudeRequest) -> bool {
+    // 检查最近的消息是否包含 Warmup 特征
+    let mut warmup_tool_result_count = 0;
+    let mut total_tool_results = 0;
+    
+    for msg in request.messages.iter().rev().take(10) {
+        match &msg.content {
+            crate::proxy::mappers::claude::models::MessageContent::String(s) => {
+                // 简单文本消息：检查是否以 Warmup 开头
+                if s.trim().starts_with("Warmup") && s.len() < 100 {
+                    return true;
+                }
+            },
+            crate::proxy::mappers::claude::models::MessageContent::Array(arr) => {
+                for block in arr {
+                    match block {
+                        // 检查 text block 是否为 Warmup
+                        crate::proxy::mappers::claude::models::ContentBlock::Text { text } => {
+                            let trimmed = text.trim();
+                            if trimmed == "Warmup" || trimmed.starts_with("Warmup\n") {
+                                return true;
+                            }
+                        },
+                        // 检查 tool_result 是否返回 Warmup 错误
+                        crate::proxy::mappers::claude::models::ContentBlock::ToolResult { 
+                            content, is_error, .. 
+                        } => {
+                            total_tool_results += 1;
+                            // content 是 serde_json::Value，需要转换为字符串检查
+                            let content_str = if let Some(s) = content.as_str() {
+                                s.to_string()
+                            } else {
+                                content.to_string()
+                            };
+                            if content_str.contains("Warmup") {
+                                warmup_tool_result_count += 1;
+                                // 如果是错误且内容为 Warmup，很可能是 warmup 请求
+                                if *is_error == Some(true) && content_str.trim().starts_with("Warmup") {
+                                    // 如果连续多个 tool_result 都是 Warmup 错误，确认为 warmup 请求
+                                    if warmup_tool_result_count >= 2 {
+                                        return true;
+                                    }
+                                }
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    
+    // 如果大多数 tool_result 都是 Warmup 错误，确认为 warmup 请求
+    if total_tool_results >= 3 && warmup_tool_result_count >= total_tool_results / 2 {
+        return true;
+    }
+    
+    false
+}
+
+/// 创建 Warmup 请求的模拟响应
+/// 
+/// 返回一个简单的响应，不消耗上游配额
+fn create_warmup_response(request: &ClaudeRequest, is_stream: bool) -> Response {
+    let model = &request.model;
+    let message_id = format!("msg_warmup_{}", chrono::Utc::now().timestamp_millis());
+    
+    if is_stream {
+        // 流式响应：发送标准的 SSE 事件序列
+        let events = vec![
+            // message_start
+            format!(
+                "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"{}\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":1,\"output_tokens\":0}}}}}}\n\n",
+                message_id, model
+            ),
+            // content_block_start
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".to_string(),
+            // content_block_delta
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n".to_string(),
+            // content_block_stop
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+            // message_delta
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n".to_string(),
+            // message_stop
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+        ];
+        
+        let body = events.join("");
+        
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .header("X-Warmup-Intercepted", "true")
+            .body(Body::from(body))
+            .unwrap()
+    } else {
+        // 非流式响应
+        let response = json!({
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "text",
+                "text": "OK"
+            }],
+            "model": model,
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+            }
+        });
+        
+        (
+            StatusCode::OK,
+            [("X-Warmup-Intercepted", "true")],
+            Json(response)
+        ).into_response()
     }
 }

@@ -61,6 +61,7 @@ pub fn create_openai_sse_stream(
     let created_ts = Utc::now().timestamp();
     
     let stream = async_stream::stream! {
+        let mut emitted_tool_calls = std::collections::HashSet::new();
         while let Some(item) = gemini_stream.next().await {
             match item {
                 Ok(bytes) => {
@@ -123,6 +124,50 @@ pub fn create_openai_sse_stream(
                                                         let data = img.get("data").and_then(|v| v.as_str()).unwrap_or("");
                                                         if !data.is_empty() {
                                                             content_out.push_str(&format!("![image](data:{};base64,{})", mime_type, data));
+                                                        }
+                                                    }
+
+                                                    // Handle function call
+                                                    if let Some(func_call) = part.get("functionCall") {
+                                                        let call_key = serde_json::to_string(func_call).unwrap_or_default();
+                                                        if !emitted_tool_calls.contains(&call_key) {
+                                                            emitted_tool_calls.insert(call_key);
+                                                            
+                                                            let name = func_call.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                                            let args = func_call.get("args").unwrap_or(&json!({})).to_string();
+                                                            
+                                                            // Generate stable ID
+                                                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                                            use std::hash::{Hash, Hasher};
+                                                            serde_json::to_string(func_call).unwrap_or_default().hash(&mut hasher);
+                                                            let call_id = format!("call_{:x}", hasher.finish());
+                                                            
+                                                            // Emit tool_calls delta
+                                                            let tool_call_chunk = json!({
+                                                                "id": &stream_id,
+                                                                "object": "chat.completion.chunk",
+                                                                "created": created_ts,
+                                                                "model": &model,
+                                                                "choices": [{
+                                                                    "index": idx as u32,
+                                                                    "delta": {
+                                                                        "role": "assistant",
+                                                                        "tool_calls": [{
+                                                                            "index": 0,
+                                                                            "id": call_id,
+                                                                            "type": "function",
+                                                                            "function": {
+                                                                                "name": name,
+                                                                                "arguments": args
+                                                                            }
+                                                                        }]
+                                                                    },
+                                                                    "finish_reason": serde_json::Value::Null
+                                                                }]
+                                                            });
+                                                            
+                                                            let sse_out = format!("data: {}\n\n", serde_json::to_string(&tool_call_chunk).unwrap_or_default());
+                                                            yield Ok::<Bytes, String>(Bytes::from(sse_out));
                                                         }
                                                     }
                                                 }
@@ -235,7 +280,36 @@ pub fn create_openai_sse_stream(
                     }
                 }
                 Err(e) => {
-                    yield Err(format!("Upstream error: {}", e));
+                    use crate::proxy::mappers::error_classifier::classify_stream_error;
+                    let (error_type, user_message, i18n_key) = classify_stream_error(&e);
+                    
+                    tracing::error!(
+                        error_type = %error_type,
+                        user_message = %user_message,
+                        i18n_key = %i18n_key,
+                        raw_error = %e,
+                        "OpenAI stream error occurred"
+                    );
+                    
+                    // 发送友好的 SSE 错误事件(包含 i18n_key 供前端翻译)
+                    let error_chunk = json!({
+                        "id": &stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": &model,
+                        "choices": [],
+                        "error": {
+                            "type": error_type,
+                            "message": user_message,
+                            "code": "stream_error",
+                            "i18n_key": i18n_key
+                        }
+                    });
+                    
+                    let sse_out = format!("data: {}\n\n", serde_json::to_string(&error_chunk).unwrap_or_default());
+                    yield Ok(Bytes::from(sse_out));
+                    yield Ok(Bytes::from("data: [DONE]\n\n"));
+                    break;
                 }
             }
         }
@@ -340,7 +414,38 @@ pub fn create_legacy_sse_stream(
                         }
                     }
                 }
-                Err(e) => yield Err(format!("Upstream error: {}", e)),
+                Err(e) => {
+                    use crate::proxy::mappers::error_classifier::classify_stream_error;
+                    let (error_type, user_message, i18n_key) = classify_stream_error(&e);
+                    
+                    tracing::error!(
+                        error_type = %error_type,
+                        user_message = %user_message,
+                        i18n_key = %i18n_key,
+                        raw_error = %e,
+                        "Legacy stream error occurred"
+                    );
+                    
+                    // 发送友好的 SSE 错误事件(包含 i18n_key 供前端翻译)
+                    let error_chunk = json!({
+                        "id": &stream_id,
+                        "object": "text_completion",
+                        "created": created_ts,
+                        "model": &model,
+                        "choices": [],
+                        "error": {
+                            "type": error_type,
+                            "message": user_message,
+                            "code": "stream_error",
+                            "i18n_key": i18n_key
+                        }
+                    });
+                    
+                    let sse_out = format!("data: {}\n\n", serde_json::to_string(&error_chunk).unwrap_or_default());
+                    yield Ok(Bytes::from(sse_out));
+                    yield Ok(Bytes::from("data: [DONE]\n\n"));
+                    break;
+                }
             }
         }
         tracing::debug!("Stream finished. Yielding [DONE]");
@@ -608,7 +713,31 @@ pub fn create_codex_sse_stream(
                         }
                     }
                 }
-                Err(e) => yield Err(format!("Upstream error: {}", e)),
+                Err(e) => {
+                    use crate::proxy::mappers::error_classifier::classify_stream_error;
+                    let (error_type, user_message, i18n_key) = classify_stream_error(&e);
+                    
+                    tracing::error!(
+                        error_type = %error_type,
+                        user_message = %user_message,
+                        i18n_key = %i18n_key,
+                        raw_error = %e,
+                        "Codex stream error occurred"
+                    );
+                    
+                    // 发送友好的错误事件(包含 i18n_key 供前端翻译)
+                    let error_ev = json!({
+                        "type": "error",
+                        "error": {
+                            "type": error_type,
+                            "message": user_message,
+                            "code": "stream_error",
+                            "i18n_key": i18n_key
+                        }
+                    });
+                    yield Ok(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_ev).unwrap())));
+                    break;
+                }
             }
         }
 

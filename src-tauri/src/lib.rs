@@ -64,6 +64,26 @@ pub fn run() {
                 }
             });
             
+            // 启动智能调度器
+            modules::scheduler::start_scheduler(app.handle().clone());
+            
+            // 启动 HTTP API 服务器（供外部程序调用，如 VS Code 插件）
+            match modules::http_api::load_settings() {
+                Ok(settings) if settings.enabled => {
+                    modules::http_api::spawn_server(settings.port);
+                    info!("HTTP API server started on port {}", settings.port);
+                }
+                Ok(_) => {
+                    info!("HTTP API server is disabled in settings");
+                }
+                Err(e) => {
+                    // 加载失败时使用默认端口
+                    error!("Failed to load HTTP API settings: {}, using default port", e);
+                    modules::http_api::spawn_server(modules::http_api::DEFAULT_PORT);
+                    info!("HTTP API server started on port {}", modules::http_api::DEFAULT_PORT);
+                }
+            }
+            
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -86,6 +106,17 @@ pub fn run() {
             commands::delete_accounts,
             commands::reorder_accounts,
             commands::switch_account,
+            // 设备指纹
+            commands::get_device_profiles,
+            commands::bind_device_profile,
+            commands::bind_device_profile_with_profile,
+            commands::preview_generate_profile,
+            commands::apply_device_profile,
+            commands::restore_original_device,
+            commands::list_device_versions,
+            commands::restore_device_version,
+            commands::delete_device_version,
+            commands::open_device_folder,
             commands::get_current_account,
             // 配额命令
             commands::fetch_account_quota,
@@ -103,6 +134,7 @@ pub fn run() {
             commands::import_custom_db,
             commands::sync_account_from_db,
             commands::save_text_file,
+            commands::read_text_file,
             commands::clear_log_cache,
             commands::open_data_folder,
             commands::get_data_dir_path,
@@ -110,6 +142,10 @@ pub fn run() {
             commands::get_antigravity_path,
             commands::get_antigravity_args,
             commands::check_for_updates,
+            commands::get_update_settings,
+            commands::save_update_settings,
+            commands::should_check_updates,
+            commands::update_last_check_time,
             commands::toggle_proxy_status,
             // 反代服务命令
             commands::proxy::start_proxy_service,
@@ -117,6 +153,13 @@ pub fn run() {
             commands::proxy::get_proxy_status,
             commands::proxy::get_proxy_stats,
             commands::proxy::get_proxy_logs,
+            commands::proxy::get_proxy_logs_paginated,
+            commands::proxy::get_proxy_log_detail,
+            commands::proxy::get_proxy_logs_count,
+            commands::proxy::export_proxy_logs,
+            commands::proxy::export_proxy_logs_json,
+            commands::proxy::get_proxy_logs_count_filtered,
+            commands::proxy::get_proxy_logs_filtered,
             commands::proxy::set_proxy_monitor_enabled,
             commands::proxy::clear_proxy_logs,
             commands::proxy::generate_api_key,
@@ -129,7 +172,28 @@ pub fn run() {
             // Autostart 命令
             commands::autostart::toggle_auto_launch,
             commands::autostart::is_auto_launch_enabled,
+            // 预热命令
+            commands::warm_up_all_accounts,
+            commands::warm_up_account,
+            // HTTP API 设置命令
+            commands::get_http_api_settings,
+            commands::save_http_api_settings,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Handle macOS dock icon click to reopen window
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                    app_handle.set_activation_policy(tauri::ActivationPolicy::Regular).unwrap_or(());
+                }
+            }
+            // Suppress unused variable warnings on non-macOS platforms
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app_handle, event);
+        });
 }

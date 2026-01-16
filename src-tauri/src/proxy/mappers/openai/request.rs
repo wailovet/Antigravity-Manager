@@ -16,7 +16,7 @@ pub fn transform_openai_request(request: &OpenAIRequest, project_id: &str, mappe
         request.model, mapped_model, config.request_type, config.image_config.is_some());
     
     // 1. 提取所有 System Message 并注入补丁
-    let system_instructions: Vec<String> = request.messages.iter()
+    let mut system_instructions: Vec<String> = request.messages.iter()
         .filter(|msg| msg.role == "system")
         .filter_map(|msg| {
             msg.content.as_ref().map(|c| match c {
@@ -33,6 +33,14 @@ pub fn transform_openai_request(request: &OpenAIRequest, project_id: &str, mappe
             })
         })
         .collect();
+
+    // [NEW] 如果请求中包含 instructions 字段，优先使用它
+    if let Some(inst) = &request.instructions {
+        if !inst.is_empty() {
+            system_instructions.insert(0, inst.clone());
+        }
+    }
+
 
 
 
@@ -67,9 +75,26 @@ pub fn transform_openai_request(request: &OpenAIRequest, project_id: &str, mappe
             };
 
             let mut parts = Vec::new();
-            
+
+            // Handle reasoning_content (thinking)
+            if let Some(reasoning) = &msg.reasoning_content {
+                if !reasoning.is_empty() {
+                    let mut thought_part = json!({
+                        "text": reasoning,
+                        "thought": true,
+                    });
+                    if let Some(ref sig) = global_thought_sig {
+                        thought_part["thoughtSignature"] = json!(sig);
+                    }
+                    parts.push(thought_part);
+                }
+            }
+
             // Handle content (multimodal or text)
-            if let Some(content) = &msg.content {
+            // [FIX] Skip standard content mapping for tool/function roles to avoid duplicate parts
+            // These are handled below in the "Handle tool response" section.
+            let is_tool_role = msg.role == "tool" || msg.role == "function";
+            if let (Some(content), false) = (&msg.content, is_tool_role) {
                 match content {
                     OpenAIContent::String(s) => {
                         if !s.is_empty() {
@@ -163,7 +188,8 @@ pub fn transform_openai_request(request: &OpenAIRequest, project_id: &str, mappe
                     let mut func_call_part = json!({
                         "functionCall": {
                             "name": if tc.function.name == "local_shell_call" { "shell" } else { &tc.function.name },
-                            "args": args
+                            "args": args,
+                            "id": &tc.id,
                         }
                     });
 
@@ -192,7 +218,8 @@ pub fn transform_openai_request(request: &OpenAIRequest, project_id: &str, mappe
                 parts.push(json!({
                     "functionResponse": {
                        "name": final_name,
-                       "response": { "result": content_val }
+                       "response": { "result": content_val },
+                       "id": msg.tool_call_id.clone().unwrap_or_default()
                     }
                 }));
             }
@@ -219,8 +246,11 @@ pub fn transform_openai_request(request: &OpenAIRequest, project_id: &str, mappe
 
     // 3. 构建请求体
     // [FIX PR #368] 检测 Gemini 3 Pro thinking 模型，注入 thinkingBudget 配置
+    // 加入 Claude thinking 模型支援
     let is_gemini_3_thinking = mapped_model.contains("gemini-3") && 
         (mapped_model.ends_with("-high") || mapped_model.ends_with("-low") || mapped_model.contains("-pro"));
+    let is_claude_thinking = mapped_model.ends_with("-thinking");
+    let is_thinking_model = is_gemini_3_thinking || is_claude_thinking;
 
     let mut gen_config = json!({
         "maxOutputTokens": request.max_tokens.unwrap_or(64000),
@@ -233,13 +263,13 @@ pub fn transform_openai_request(request: &OpenAIRequest, project_id: &str, mappe
         gen_config["candidateCount"] = json!(n);
     }
 
-    // [FIX PR #368] 为 Gemini 3 Pro 注入 thinkingConfig (使用 thinkingBudget 而非 thinkingLevel)
-    if is_gemini_3_thinking {
+    // [FIX PR #368] 为 thinking 模型注入 thinkingConfig (使用 thinkingBudget 而非 thinkingLevel)
+    if is_thinking_model {
         gen_config["thinkingConfig"] = json!({
             "includeThoughts": true,
             "thinkingBudget": 16000
         });
-        tracing::debug!("[OpenAI-Request] Injected thinkingConfig for Gemini 3 Pro: thinkingBudget=16000");
+        tracing::debug!("[OpenAI-Request] Injected thinkingConfig for model {}: thinkingBudget=16000", mapped_model);
     }
 
 
@@ -340,19 +370,22 @@ pub fn transform_openai_request(request: &OpenAIRequest, project_id: &str, mappe
     let user_has_antigravity = system_instructions.iter()
         .any(|s| s.contains("You are Antigravity"));
 
-    if !system_instructions.is_empty() {
-        if !user_has_antigravity {
-            // 用户有系统提示词但没有 Antigravity 身份,在前面添加
-            let combined = format!("{}\n\n{}", antigravity_identity, system_instructions.join("\n\n"));
-            inner_request["systemInstruction"] = json!({ "parts": [{"text": combined}] });
-        } else {
-            // 用户已提供 Antigravity 身份,直接使用
-            inner_request["systemInstruction"] = json!({ "parts": [{"text": system_instructions.join("\n\n")}] });
-        }
-    } else {
-        // 用户没有系统提示词,只注入 Antigravity 身份
-        inner_request["systemInstruction"] = json!({ "parts": [{"text": antigravity_identity}] });
+    let mut parts = Vec::new();
+
+    // 1. Antigravity 身份 (如果需要, 作为独立 Part 插入)
+    if !user_has_antigravity {
+        parts.push(json!({"text": antigravity_identity}));
     }
+
+    // 2. 追加用户指令 (作为独立 Parts)
+    for inst in system_instructions {
+        parts.push(json!({"text": inst}));
+    }
+
+    inner_request["systemInstruction"] = json!({ 
+        "role": "user",
+        "parts": parts 
+    });
     
     if config.inject_google_search {
         crate::proxy::mappers::common_utils::inject_google_search_tool(&mut inner_request);
@@ -429,6 +462,7 @@ mod tests {
                 name: None,
             }],
             stream: false,
+            n: None,
             max_tokens: None,
             temperature: None,
             top_p: None,

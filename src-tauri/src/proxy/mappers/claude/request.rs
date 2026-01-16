@@ -2,7 +2,9 @@
 // 对应 transformClaudeRequestIn
 
 use super::models::*;
-use crate::proxy::mappers::signature_store::get_thought_signature;
+use crate::proxy::mappers::signature_store::get_thought_signature; // Deprecated, kept for fallback
+use crate::proxy::mappers::tool_result_compressor;
+use crate::proxy::session_manager::SessionManager;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -70,33 +72,62 @@ fn build_safety_settings() -> Value {
 /// 1. VS Code 等客户端会将历史消息(包含 cache_control)原封不动发回
 /// 2. Anthropic API 不接受请求中包含 cache_control 字段
 /// 3. 即使是转发到 Gemini,也应该清理以保持协议纯净性
+/// 
+/// [FIX #593] 增强版本:添加详细日志用于调试 MCP 工具兼容性问题
 fn clean_cache_control_from_messages(messages: &mut [Message]) {
-    for msg in messages.iter_mut() {
+    tracing::info!(
+        "[DEBUG-593] Starting cache_control cleanup for {} messages",
+        messages.len()
+    );
+    
+    let mut total_cleaned = 0;
+    
+    for (idx, msg) in messages.iter_mut().enumerate() {
         if let MessageContent::Array(blocks) = &mut msg.content {
-            for block in blocks.iter_mut() {
+            for (block_idx, block) in blocks.iter_mut().enumerate() {
                 match block {
                     ContentBlock::Thinking { cache_control, .. } => {
                         if cache_control.is_some() {
-                            tracing::debug!("[Cache-Control-Cleaner] Removed cache_control from Thinking block");
+                            tracing::warn!(
+                                "[DEBUG-593] Found cache_control in Thinking block at message[{}].content[{}]",
+                                idx,
+                                block_idx
+                            );
                             *cache_control = None;
+                            total_cleaned += 1;
                         }
                     }
                     ContentBlock::Image { cache_control, .. } => {
                         if cache_control.is_some() {
-                            tracing::debug!("[Cache-Control-Cleaner] Removed cache_control from Image block");
+                            tracing::debug!(
+                                "[Cache-Control-Cleaner] Removed cache_control from Image block at message[{}].content[{}]",
+                                idx,
+                                block_idx
+                            );
                             *cache_control = None;
+                            total_cleaned += 1;
                         }
                     }
                     ContentBlock::Document { cache_control, .. } => {
                         if cache_control.is_some() {
-                            tracing::debug!("[Cache-Control-Cleaner] Removed cache_control from Document block");
+                            tracing::debug!(
+                                "[Cache-Control-Cleaner] Removed cache_control from Document block at message[{}].content[{}]",
+                                idx,
+                                block_idx
+                            );
                             *cache_control = None;
+                            total_cleaned += 1;
                         }
                     }
                     ContentBlock::ToolUse { cache_control, .. } => {
                         if cache_control.is_some() {
-                            tracing::debug!("[Cache-Control-Cleaner] Removed cache_control from ToolUse block");
+                            tracing::debug!(
+                                "[Cache-Control-Cleaner] Removed cache_control from ToolUse block at message[{}].content[{}]",
+                                idx,
+                                block_idx
+                            );
                             *cache_control = None;
+                            total_cleaned += 1;
                         }
                     }
                     _ => {}
@@ -104,9 +135,154 @@ fn clean_cache_control_from_messages(messages: &mut [Message]) {
             }
         }
     }
+    
+    if total_cleaned > 0 {
+        tracing::info!(
+            "[DEBUG-593] Cache control cleanup complete: removed {} cache_control fields",
+            total_cleaned
+        );
+    } else {
+        tracing::debug!("[DEBUG-593] No cache_control fields found");
+    }
+}
+
+/// [FIX #593] 递归深度清理 JSON 中的 cache_control 字段
+/// 
+/// 用于处理嵌套结构和非标准位置的 cache_control。
+/// 这是最后一道防线,确保发送给 Antigravity 的请求中不包含任何 cache_control。
+fn deep_clean_cache_control(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if map.remove("cache_control").is_some() {
+                tracing::debug!("[DEBUG-593] Removed cache_control from nested JSON object");
+            }
+            for (_, v) in map.iter_mut() {
+                deep_clean_cache_control(v);
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                deep_clean_cache_control(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// [FIX #564] Sort blocks in assistant messages to ensure thinking blocks are first
+/// 
+/// When context compression (kilo) reorders message blocks, thinking blocks may appear
+/// after text blocks. Claude/Anthropic API requires thinking blocks to be first if
+/// any thinking blocks exist in the message. This function pre-sorts blocks to ensure
+/// thinking/redacted_thinking blocks always come before other block types.
+fn sort_thinking_blocks_first(messages: &mut [Message]) {
+    for msg in messages.iter_mut() {
+        if msg.role == "assistant" {
+            if let MessageContent::Array(blocks) = &mut msg.content {
+                // [FIX #709] Triple-stage partition: [Thinking, Text, ToolUse]
+                // This ensures protocol compliance while maintaining logical order.
+                
+                let mut thinking_blocks: Vec<ContentBlock> = Vec::new();
+                let mut text_blocks: Vec<ContentBlock> = Vec::new();
+                let mut tool_blocks: Vec<ContentBlock> = Vec::new();
+                let mut other_blocks: Vec<ContentBlock> = Vec::new();
+                
+                let original_len = blocks.len();
+                let mut needs_reorder = false;
+                let mut saw_non_thinking = false;
+
+                for (_i, block) in blocks.iter().enumerate() {
+                    match block {
+                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                            if saw_non_thinking {
+                                needs_reorder = true;
+                            }
+                        }
+                        ContentBlock::Text { .. } => {
+                            saw_non_thinking = true;
+                        }
+                        ContentBlock::ToolUse { .. } => {
+                            saw_non_thinking = true;
+                            // Check if tool is after text (this is normal, but we want a strict group order)
+                        }
+                        _ => saw_non_thinking = true,
+                    }
+                }
+
+                if needs_reorder || original_len > 1 {
+                    // For safety, we always perform the triple partition if there's more than one block.
+                    // This also handles empty text block filtering.
+                    for block in blocks.drain(..) {
+                        match &block {
+                            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                                thinking_blocks.push(block);
+                            }
+                            ContentBlock::Text { text } => {
+                                // Filter out purely empty or structural text like "(no content)"
+                                if !text.trim().is_empty() && text != "(no content)" {
+                                    text_blocks.push(block);
+                                }
+                            }
+                            ContentBlock::ToolUse { .. } => {
+                                tool_blocks.push(block);
+                            }
+                            _ => {
+                                other_blocks.push(block);
+                            }
+                        }
+                    }
+
+                    // Reconstruct in strict order: Thinking -> Text/Other -> Tool
+                    blocks.extend(thinking_blocks);
+                    blocks.extend(text_blocks);
+                    blocks.extend(other_blocks);
+                    blocks.extend(tool_blocks);
+
+                    if needs_reorder {
+                        tracing::warn!(
+                            "[FIX #709] Reordered assistant messages to [Thinking, Text, Tool] structure."
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// 转换 Claude 请求为 Gemini v1internal 格式
+
+/// [FIX #709] Reorder serialized Gemini parts to ensure thinking blocks are first
+fn reorder_gemini_parts(parts: &mut Vec<Value>) {
+    if parts.len() <= 1 {
+        return;
+    }
+
+    let mut thinking_parts = Vec::new();
+    let mut text_parts = Vec::new();
+    let mut tool_parts = Vec::new();
+    let mut other_parts = Vec::new();
+
+    for part in parts.drain(..) {
+        if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
+            thinking_parts.push(part);
+        } else if part.get("functionCall").is_some() {
+            tool_parts.push(part);
+        } else if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+            // Filter empty text parts that might have been created during merging
+            if !text.trim().is_empty() && text != "(no content)" {
+                text_parts.push(part);
+            }
+        } else {
+            other_parts.push(part);
+        }
+    }
+
+    parts.extend(thinking_parts);
+    parts.extend(text_parts);
+    parts.extend(other_parts);
+    parts.extend(tool_parts);
+}
+
 pub fn transform_claude_request_in(
     claude_req: &ClaudeRequest,
     project_id: &str,
@@ -116,7 +292,17 @@ pub fn transform_claude_request_in(
     // 原封不动发回导致的 "Extra inputs are not permitted" 错误
     let mut cleaned_req = claude_req.clone();
     clean_cache_control_from_messages(&mut cleaned_req.messages);
+    
+    // [FIX #564] Pre-sort thinking blocks to be first in assistant messages
+    // This handles cases where context compression (kilo) incorrectly reorders blocks
+    sort_thinking_blocks_first(&mut cleaned_req.messages);
+    
     let claude_req = &cleaned_req; // 后续使用清理后的请求
+
+    // [NEW] Generate session ID for signature tracking
+    // This enables session-isolated signature storage, preventing cross-conversation pollution
+    let session_id = SessionManager::extract_session_id(claude_req);
+    tracing::debug!("[Claude-Request] Session ID: {}", session_id);
 
     // 检测是否有联网工具 (server tool or built-in tool)
     let has_web_search_tool = claude_req
@@ -134,8 +320,19 @@ pub fn transform_claude_request_in(
     // 用于存储 tool_use id -> name 映射
     let mut tool_id_to_name: HashMap<String, String> = HashMap::new();
 
-    // 1. System Instruction (注入动态身份防护)
-    let system_instruction = build_system_instruction(&claude_req.system, &claude_req.model);
+    // 检测是否有 mcp__ 开头的工具
+    let has_mcp_tools = claude_req
+        .tools
+        .as_ref()
+        .map(|tools| {
+            tools.iter().any(|t| {
+                t.name.as_deref().map(|n| n.starts_with("mcp__")).unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+
+    // 1. System Instruction (注入动态身份防护 & MCP XML 协议)
+    let system_instruction = build_system_instruction(&claude_req.system, &claude_req.model, has_mcp_tools);
 
     //  Map model name (Use standard mapping)
     // [IMPROVED] 提取 web search 模型为常量，便于维护
@@ -260,6 +457,7 @@ pub fn transform_claude_request_in(
         is_thinking_enabled,
         allow_dummy_thought,
         &mapped_model,
+        &session_id,
     )?;
 
     // 3. Tools
@@ -340,6 +538,10 @@ pub fn transform_claude_request_in(
         }
     }
 
+    // [FIX #593] 最后一道防线: 递归深度清理所有 cache_control 字段
+    // 确保发送给 Antigravity 的请求中不包含任何 cache_control
+    deep_clean_cache_control(&mut body);
+    tracing::debug!("[DEBUG-593] Final deep clean complete, request ready to send");
 
     Ok(body)
 }
@@ -435,7 +637,7 @@ fn has_valid_signature_for_function_calls(
 }
 
 /// 构建 System Instruction (支持动态身份映射与 Prompt 隔离)
-fn build_system_instruction(system: &Option<SystemPrompt>, model_name: &str) -> Option<Value> {
+fn build_system_instruction(system: &Option<SystemPrompt>, _model_name: &str, has_mcp_tools: bool) -> Option<Value> {
     let mut parts = Vec::new();
 
     // [NEW] Antigravity 身份指令 (原始简化版)
@@ -473,16 +675,52 @@ fn build_system_instruction(system: &Option<SystemPrompt>, model_name: &str) -> 
     if let Some(sys) = system {
         match sys {
             SystemPrompt::String(text) => {
-                parts.push(json!({"text": text}));
+                // [FIX] 过滤 OpenCode 默认提示词，但保留用户自定义指令 (Instructions from: ...)
+                if text.contains("You are an interactive CLI tool") {
+                    // 提取用户自定义指令部分
+                    if let Some(idx) = text.find("Instructions from:") {
+                        let custom_part = &text[idx..];
+                        tracing::info!("[Claude-Request] Extracted custom instructions (len: {}), filtered default prompt", custom_part.len());
+                        parts.push(json!({"text": custom_part}));
+                    } else {
+                        tracing::info!("[Claude-Request] Filtering out OpenCode default system instruction (len: {})", text.len());
+                    }
+                } else {
+                    parts.push(json!({"text": text}));
+                }
             }
             SystemPrompt::Array(blocks) => {
                 for block in blocks {
                     if block.block_type == "text" {
-                        parts.push(json!({"text": block.text}));
+                        // [FIX] 过滤 OpenCode 默认提示词，但保留用户自定义指令
+                        if block.text.contains("You are an interactive CLI tool") {
+                            if let Some(idx) = block.text.find("Instructions from:") {
+                                let custom_part = &block.text[idx..];
+                                tracing::info!("[Claude-Request] Extracted custom instructions from block (len: {})", custom_part.len());
+                                parts.push(json!({"text": custom_part}));
+                            } else {
+                                tracing::info!("[Claude-Request] Filtering out OpenCode default system block (len: {})", block.text.len());
+                            }
+                        } else {
+                            parts.push(json!({"text": block.text}));
+                        }
                     }
                 }
             }
         }
+    }
+
+    // [NEW] MCP XML Bridge: 如果存在 mcp__ 开头的工具，注入专用的调用协议
+    // 这能有效规避部分 MCP 链路在标准的 tool_use 协议下解析不稳的问题
+    if has_mcp_tools {
+        let mcp_xml_prompt = "\n\
+        ==== MCP XML 工具调用协议 (Workaround) ====\n\
+        当你需要调用名称以 `mcp__` 开头的 MCP 工具时：\n\
+        1) 优先尝试 XML 格式调用：输出 `<mcp__tool_name>{\"arg\":\"value\"}</mcp__tool_name>`。\n\
+        2) 必须直接输出 XML 块，无需 markdown 包装，内容为 JSON 格式的入参。\n\
+        3) 这种方式具有更高的连通性和容错性，适用于大型结果返回场景。\n\
+        ===========================================";
+        parts.push(json!({"text": mcp_xml_prompt}));
     }
 
     // 如果用户没有提供任何系统提示词,添加结束标记
@@ -491,6 +729,7 @@ fn build_system_instruction(system: &Option<SystemPrompt>, model_name: &str) -> 
     }
 
     Some(json!({
+        "role": "user",
         "parts": parts
     }))
 }
@@ -502,19 +741,78 @@ fn build_contents(
     is_thinking_enabled: bool,
     allow_dummy_thought: bool,
     mapped_model: &str,
+    session_id: &str, // [NEW v3.3.17] Session ID for signature caching
 ) -> Result<Value, String> {
     let mut contents = Vec::new();
     let mut last_thought_signature: Option<String> = None;
+    // Track pending tool_use IDs for recovery
+    let mut pending_tool_use_ids: Vec<String> = Vec::new();
+    
+    // [NEW] 用于识别并过滤 Claude Code 重复回显的任务指令
+    let mut last_user_task_text_normalized: Option<String> = None;
+    let mut previous_was_tool_result = false;
 
     let _msg_count = messages.len();
+
+    // [FIX #632] Pre-scan all messages to identify all tool_result IDs that ALREADY exist in the conversation.
+    // This prevents Elastic-Recovery from injecting duplicate results if they are present later in the chain.
+    let mut existing_tool_result_ids = std::collections::HashSet::new();
+    for msg in messages {
+        if let MessageContent::Array(blocks) = &msg.content {
+            for block in blocks {
+                if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                    existing_tool_result_ids.insert(tool_use_id.clone());
+                }
+            }
+        }
+    }
+
     for (_i, msg) in messages.iter().enumerate() {
         let role = if msg.role == "assistant" {
+            // Proactive Tool Chain Repair:
+            // If we are about to process an Assistant message, but we still have pending tool_use_ids,
+            // it means the previous turn was interrupted or the user ignored the tool.
+            // We MUST inject a synthetic User message with error results to close the loop.
+            if !pending_tool_use_ids.is_empty() {
+                tracing::warn!("[Elastic-Recovery] Detected interrupted tool chain (Assistant -> Assistant). Injecting synthetic User message for IDs: {:?}", pending_tool_use_ids);
+                
+                let synthetic_parts: Vec<serde_json::Value> = pending_tool_use_ids.iter()
+                    .filter(|id| !existing_tool_result_ids.contains(*id)) // [FIX #632] Only inject if ID is truly missing
+                    .map(|id| {
+                        let name = tool_id_to_name.get(id).cloned().unwrap_or(id.clone());
+                        json!({
+                            "functionResponse": {
+                                "name": name,
+                                "response": {
+                                    "result": "Tool execution interrupted. No result provided."
+                                },
+                                "id": id
+                            }
+                        })
+                    }).collect();
+
+                if !synthetic_parts.is_empty() {
+                    contents.push(json!({
+                        "role": "user",
+                        "parts": synthetic_parts
+                    }));
+                }
+                // Clear pending IDs as we have handled them
+                pending_tool_use_ids.clear();
+            }
             "model"
         } else {
             &msg.role
         };
 
         let mut parts = Vec::new();
+
+        // Track tool results in the current turn to identify missing ones
+        let mut current_turn_tool_result_ids = std::collections::HashSet::new();
+
+        // Track if we have already seen non-thinking content in this message.
+        // Anthropic/Gemini protocol: Thinking blocks MUST come first.
+        let mut saw_non_thinking = false;
 
         match &msg.content {
             MessageContent::String(text) => {
@@ -529,20 +827,40 @@ fn build_contents(
                     match item {
                         ContentBlock::Text { text } => {
                             if text != "(no content)" {
+                                // [NEW] 任务去重逻辑: 如果当前是 User 消息，且紧跟在 ToolResult 之后，
+                                // 检查该文本是否与上一轮任务描述完全一致。
+                                if role == "user" && previous_was_tool_result {
+                                    if let Some(last_task) = &last_user_task_text_normalized {
+                                        let current_normalized = text.replace(|c: char| c.is_whitespace(), "");
+                                        if !current_normalized.is_empty() && current_normalized == *last_task {
+                                            tracing::info!("[Claude-Request] Dropping duplicated task text echo (len: {})", text.len());
+                                            continue;
+                                        }
+                                    }
+                                }
+                                
                                 parts.push(json!({"text": text}));
+                                saw_non_thinking = true;
+                                
+                                // 记录最近一次 User 任务文本用于后续比对
+                                if role == "user" {
+                                    last_user_task_text_normalized = Some(text.replace(|c: char| c.is_whitespace(), ""));
+                                }
+                                previous_was_tool_result = false;
                             }
                         }
                         ContentBlock::Thinking { thinking, signature, .. } => {
-                            tracing::error!("[DEBUG-TRANSFORM] Processing thinking block. Sig: {:?}", signature);
+                            tracing::debug!("[DEBUG-TRANSFORM] Processing thinking block. Sig: {:?}", signature);
                             
                             // [HOTFIX] Gemini Protocol Enforcement: Thinking block MUST be the first block.
                             // If we already have content (like Text), we must downgrade this thinking block to Text.
-                            if !parts.is_empty() {
+                            if saw_non_thinking || !parts.is_empty() {
                                 tracing::warn!("[Claude-Request] Thinking block found at non-zero index (prev parts: {}). Downgrading to Text.", parts.len());
                                 if !thinking.is_empty() {
                                     parts.push(json!({
                                         "text": thinking
                                     }));
+                                    saw_non_thinking = true;
                                 }
                                 continue;
                             }
@@ -600,7 +918,10 @@ fn build_contents(
                                 }
 
                                 last_thought_signature = Some(sig.clone());
-                                part["thoughtSignature"] = json!(sig);
+                                // [FIX #545] Encode raw signature to Base64 for Gemini
+                                use base64::Engine;
+                                let encoded_sig = base64::engine::general_purpose::STANDARD.encode(sig);
+                                part["thoughtSignature"] = json!(encoded_sig);
                             }
                             parts.push(part);
                         }
@@ -610,6 +931,7 @@ fn build_contents(
                             parts.push(json!({
                                 "text": format!("[Redacted Thinking: {}]", data)
                             }));
+                            saw_non_thinking = true;
                             continue;
                         }
                         ContentBlock::Image { source, .. } => {
@@ -620,6 +942,7 @@ fn build_contents(
                                         "data": source.data
                                     }
                                 }));
+                                saw_non_thinking = true;
                             }
                         }
                         ContentBlock::Document { source, .. } => {
@@ -630,6 +953,7 @@ fn build_contents(
                                         "data": source.data
                                     }
                                 }));
+                                saw_non_thinking = true;
                             }
                         }
                         ContentBlock::ToolUse { id, name, input, signature, .. } => {
@@ -640,6 +964,12 @@ fn build_contents(
                                     "id": id
                                 }
                             });
+                            saw_non_thinking = true;
+                            
+                            // Track pending tool use
+                            if role == "model" {
+                                pending_tool_use_ids.push(id.clone());
+                            }
                             
                             // [New] 递归清理参数中可能存在的非法校验字段
                             crate::proxy::common::json_schema::clean_json_schema(&mut part);
@@ -647,25 +977,42 @@ fn build_contents(
                             // 存储 id -> name 映射
                             tool_id_to_name.insert(id.clone(), name.clone());
 
-                            // Signature resolution logic (Priority: Client -> Context -> Cache -> Global Store)
+                            // Signature resolution logic 
+                            // Priority: Client -> Context -> Session Cache -> Tool Cache -> Global Store (deprecated)
                             // [CRITICAL FIX] Do NOT use skip_thought_signature_validator for Vertex AI
                             // Vertex AI rejects this sentinel value, so we only add thoughtSignature if we have a real one
                             let final_sig = signature.as_ref()
                                 .or(last_thought_signature.as_ref())
                                 .cloned()
                                 .or_else(|| {
-                                    // [NEW] Try layer 1 cache (Tool ID -> Signature)
-                                    crate::proxy::SignatureCache::global().get_tool_signature(id)
+                                    // [NEW v3.3.17] Try session-based signature cache first (Layer 3)
+                                    // This provides conversation-level isolation
+                                    crate::proxy::SignatureCache::global().get_session_signature(&session_id)
                                         .map(|s| {
-                                            tracing::info!("[Claude-Request] Recovered signature from cache for tool_id: {}", id);
+                                            tracing::info!(
+                                                "[Claude-Request] Recovered signature from SESSION cache (session: {}, len: {})", 
+                                                session_id, s.len()
+                                            );
                                             s
                                         })
                                 })
                                 .or_else(|| {
+                                    // Try tool-specific signature cache (Layer 1)
+                                    crate::proxy::SignatureCache::global().get_tool_signature(id)
+                                        .map(|s| {
+                                            tracing::info!("[Claude-Request] Recovered signature from TOOL cache for tool_id: {}", id);
+                                            s
+                                        })
+                                })
+                                .or_else(|| {
+                                    // [DEPRECATED] Global store fallback - kept for backward compatibility
                                     let global_sig = get_thought_signature();
                                     if global_sig.is_some() {
-                                        tracing::info!("[Claude-Request] Using global thought_signature fallback (length: {})", 
-                                            global_sig.as_ref().unwrap().len());
+                                        tracing::warn!(
+                                            "[Claude-Request] Using deprecated GLOBAL thought_signature fallback (length: {}). \
+                                             This indicates session cache miss.", 
+                                            global_sig.as_ref().unwrap().len()
+                                        );
                                     }
                                     global_sig
                                 });
@@ -673,7 +1020,10 @@ fn build_contents(
                             // Do NOT add skip_thought_signature_validator - Vertex AI rejects it
 
                             if let Some(sig) = final_sig {
-                                part["thoughtSignature"] = json!(sig);
+                                // [FIX #545] Encode raw signature to Base64 for Gemini
+                                use base64::Engine;
+                                let encoded_sig = base64::engine::general_purpose::STANDARD.encode(sig);
+                                part["thoughtSignature"] = json!(encoded_sig);
                             }
                             parts.push(part);
                         }
@@ -683,22 +1033,38 @@ fn build_contents(
                             is_error,
                             ..
                         } => {
+                            // Mark this tool ID as resolved in this turn
+                            current_turn_tool_result_ids.insert(tool_use_id.clone());
                             // 优先使用之前记录的 name，否则用 tool_use_id
                             let func_name = tool_id_to_name
                                 .get(tool_use_id)
                                 .cloned()
                                 .unwrap_or_else(|| tool_use_id.clone());
 
-                            // 处理 content：可能是一个内容块数组或单字符串
-                            let mut merged_content = match content {
+                            // [FIX #593] 工具输出压缩: 处理超大工具输出
+                            // 使用智能压缩策略(浏览器快照、大文件提示等)
+                            let mut compacted_content = content.clone();
+                            if let Some(blocks) = compacted_content.as_array_mut() {
+                                tool_result_compressor::sanitize_tool_result_blocks(blocks);
+                            }
+
+                            // Smart Truncation: strict image removal
+                            // Remove all Base64 images from historical tool results to save context.
+                            // Only allow text.
+                            let mut merged_content = match &compacted_content {
                                 serde_json::Value::String(s) => s.clone(),
                                 serde_json::Value::Array(arr) => arr
                                     .iter()
                                     .filter_map(|block| {
-                                        if let Some(text) =
-                                            block.get("text").and_then(|v| v.as_str())
-                                        {
-                                            Some(text)
+                                        if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                            Some(text.to_string())
+                                        } else if block.get("source").is_some() {
+                                             // If it's an image/document, replace with placeholder
+                                             if block.get("type").and_then(|v| v.as_str()) == Some("image") {
+                                                 Some("[image omitted to save context]".to_string())
+                                             } else {
+                                                 None
+                                             }
                                         } else {
                                             None
                                         }
@@ -707,6 +1073,15 @@ fn build_contents(
                                     .join("\n"),
                                 _ => content.to_string(),
                             };
+                            
+                            // Smart Truncation: max chars limit
+                            const MAX_TOOL_RESULT_CHARS: usize = 200_000;
+                            if merged_content.len() > MAX_TOOL_RESULT_CHARS {
+                                tracing::warn!("Truncating tool result from {} chars to {}", merged_content.len(), MAX_TOOL_RESULT_CHARS);
+                                let mut truncated = merged_content.chars().take(MAX_TOOL_RESULT_CHARS).collect::<String>();
+                                truncated.push_str("\n...[truncated output]");
+                                merged_content = truncated;
+                            }
 
                             // [优化] 如果结果为空，注入显式确认信号，防止模型幻觉
                             if merged_content.trim().is_empty() {
@@ -718,21 +1093,27 @@ fn build_contents(
                                 }
                             }
 
-                            let mut part = json!({
-                                "functionResponse": {
-                                    "name": func_name,
-                                    "response": {"result": merged_content},
-                                    "id": tool_use_id
+                                parts.push(json!({
+                                    "functionResponse": {
+                                        "name": func_name,
+                                        "response": {"result": merged_content},
+                                        "id": tool_use_id
+                                    }
+                                }));
+                                
+                                // [FIX] Tool Result 也需要回填签名（如果上下文中有）
+                                if let Some(sig) = last_thought_signature.as_ref() {
+                                    // [FIX #545] Encode raw signature to Base64 for Gemini
+                                    use base64::Engine;
+                                    let encoded_sig = base64::engine::general_purpose::STANDARD.encode(sig);
+                                    if let Some(last_part) = parts.last_mut() {
+                                        last_part["thoughtSignature"] = json!(encoded_sig);
+                                    }
                                 }
-                            });
-
-                            // [修复] Tool Result 也需要回填签名（如果上下文中有）
-                            if let Some(sig) = last_thought_signature.as_ref() {
-                                part["thoughtSignature"] = json!(sig);
+                                
+                                // 标记状态，用于下一条 User 消息的去重判断
+                                previous_was_tool_result = true;
                             }
-
-                            parts.push(part);
-                        }
                         // ContentBlock::RedactedThinking handled above at line 583
                         ContentBlock::ServerToolUse { .. } | ContentBlock::WebSearchToolResult { .. } => {
                             // 搜索结果 block 不应由客户端发回给上游 (已由 tool_result 替代)
@@ -741,6 +1122,34 @@ fn build_contents(
                     }
                 }
             }
+        }
+        
+        // If this is a User message, check if we need to inject missing tool results
+        if role == "user" && !pending_tool_use_ids.is_empty() {
+             let missing_ids: Vec<_> = pending_tool_use_ids.iter()
+                 .filter(|id| !current_turn_tool_result_ids.contains(*id))
+                 .cloned()
+                 .collect();
+
+             if !missing_ids.is_empty() {
+                 tracing::warn!("[Elastic-Recovery] Injecting {} missing tool results into User message (IDs: {:?})", missing_ids.len(), missing_ids);
+                 for id in missing_ids.iter().rev() { // Insert in reverse order to maintain order at index 0? No, just insert at 0.
+                     let name = tool_id_to_name.get(id).cloned().unwrap_or(id.clone());
+                     let synthetic_part = json!({
+                         "functionResponse": {
+                             "name": name,
+                             "response": {
+                                 "result": "Tool execution interrupted. No result provided."
+                             },
+                             "id": id
+                         }
+                     });
+                     // Prepend to ensure they are present before any text
+                     parts.insert(0, synthetic_part);
+                 }
+             }
+             // All pending IDs are now handled (either present or injected)
+             pending_tool_use_ids.clear();
         }
 
         // Fix for "Thinking enabled, assistant message must start with thinking block" 400 error
@@ -844,6 +1253,11 @@ fn merge_adjacent_roles(mut contents: Vec<Value>) -> Vec<Value> {
             if let Some(current_parts) = current_msg.get_mut("parts").and_then(|p| p.as_array_mut()) {
                 if let Some(next_parts) = msg.get("parts").and_then(|p| p.as_array()) {
                     current_parts.extend(next_parts.clone());
+                    
+                    // [FIX #709] Core Fix: After merging parts from adjacent messages, 
+                    // we must RE-SORT them to ensure any thinking blocks from the 
+                    // second message are moved to the very front of the combined array.
+                    reorder_gemini_parts(current_parts);
                 }
             }
         } else {
@@ -1467,4 +1881,73 @@ mod tests {
         assert!(text.contains("[Redacted Thinking: some data]"));
         assert!(parts[0].get("thought").is_none(), "Redacted thinking should NOT have thought: true");
     }
+
+    // ==================================================================================
+    // [FIX #564] Test: Thinking blocks are sorted to be first after context compression
+    // ==================================================================================
+    #[test]
+    fn test_thinking_blocks_sorted_first_after_compression() {
+        // Simulate kilo context compression reordering: text BEFORE thinking
+        let mut messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: MessageContent::Array(vec![
+                    // Wrong order: Text before Thinking (simulates kilo compression)
+                    ContentBlock::Text { text: "Some regular text".to_string() },
+                    ContentBlock::Thinking { 
+                        thinking: "My thinking process".to_string(),
+                        signature: Some("valid_signature_1234567890_abcdefghij_klmnopqrstuvwxyz_test".to_string()),
+                        cache_control: None,
+                    },
+                    ContentBlock::Text { text: "More text".to_string() },
+                ]),
+            }
+        ];
+        
+        // Apply the fix
+        sort_thinking_blocks_first(&mut messages);
+        
+        // Verify thinking is now first
+        if let MessageContent::Array(blocks) = &messages[0].content {
+            assert_eq!(blocks.len(), 3, "Should still have 3 blocks");
+            assert!(matches!(blocks[0], ContentBlock::Thinking { .. }), "Thinking should be first");
+            assert!(matches!(blocks[1], ContentBlock::Text { .. }), "Text should be second");
+            assert!(matches!(blocks[2], ContentBlock::Text { .. }), "Text should be third");
+            
+            // Verify content preserved
+            if let ContentBlock::Thinking { thinking, .. } = &blocks[0] {
+                assert_eq!(thinking, "My thinking process");
+            }
+        } else {
+            panic!("Expected Array content");
+        }
+    }
+
+    #[test]
+    fn test_thinking_blocks_no_reorder_when_already_first() {
+        // Correct order: Thinking already first - should not trigger reorder
+        let mut messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: MessageContent::Array(vec![
+                    ContentBlock::Thinking { 
+                        thinking: "My thinking".to_string(),
+                        signature: Some("sig123".to_string()),
+                        cache_control: None,
+                    },
+                    ContentBlock::Text { text: "Some text".to_string() },
+                ]),
+            }
+        ];
+        
+        // Apply the fix (should be no-op)
+        sort_thinking_blocks_first(&mut messages);
+        
+        // Verify order unchanged
+        if let MessageContent::Array(blocks) = &messages[0].content {
+            assert!(matches!(blocks[0], ContentBlock::Thinking { .. }), "Thinking should still be first");
+            assert!(matches!(blocks[1], ContentBlock::Text { .. }), "Text should still be second");
+        }
+    }
 }
+
