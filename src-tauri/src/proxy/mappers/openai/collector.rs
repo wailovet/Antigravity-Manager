@@ -66,6 +66,7 @@ where
         created: chrono::Utc::now().timestamp() as u64,
         model: String::new(),
         choices: vec![],
+        usage: None,
     };
 
     let mut content = String::new();
