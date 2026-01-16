@@ -3,9 +3,11 @@ import { listen } from '@tauri-apps/api/event';
 import ModalDialog from '../common/ModalDialog';
 import { useTranslation } from 'react-i18next';
 import { request as invoke } from '../../utils/request';
-import { Trash2, Search, X } from 'lucide-react';
+import { Trash2, Search, X, Copy, CheckCircle, ChevronLeft, ChevronRight } from 'lucide-react';
+
 import { AppConfig } from '../../types/config';
 import { formatCompactNumber } from '../../utils/format';
+
 
 interface ProxyRequestLog {
     id: string;
@@ -34,6 +36,95 @@ interface ProxyMonitorProps {
     className?: string;
 }
 
+// Log Table Component
+interface LogTableProps {
+    logs: ProxyRequestLog[];
+    loading: boolean;
+    onLogClick: (log: ProxyRequestLog) => void;
+    t: any;
+}
+
+const LogTable: React.FC<LogTableProps> = ({
+    logs,
+    loading,
+    onLogClick,
+    t
+}) => {
+    return (
+        <div
+            className="flex-1 overflow-y-auto overflow-x-auto bg-white dark:bg-base-100"
+            style={{
+                minHeight: '200px',
+                maxHeight: 'calc(100vh - 320px)'
+            }}
+        >
+            <table className="table table-xs w-full">
+                <thead className="bg-gray-50 dark:bg-base-200 text-gray-500 sticky top-0 z-10">
+                    <tr>
+                        <th style={{ width: '60px' }}>{t('monitor.table.status')}</th>
+                        <th style={{ width: '60px' }}>{t('monitor.table.method')}</th>
+                        <th style={{ width: '180px' }}>{t('monitor.table.model')}</th>
+                        <th style={{ width: '140px' }}>{t('monitor.table.account')}</th>
+                        <th>{t('monitor.table.path')}</th>
+                        <th className="text-right" style={{ width: '90px' }}>{t('monitor.table.usage')}</th>
+                        <th className="text-right" style={{ width: '80px' }}>{t('monitor.table.duration')}</th>
+                        <th className="text-right" style={{ width: '80px' }}>{t('monitor.table.time')}</th>
+                    </tr>
+                </thead>
+                <tbody className="font-mono text-gray-700 dark:text-gray-300">
+                    {logs.map((log) => (
+                        <tr
+                            key={log.id}
+                            className="hover:bg-blue-50 dark:hover:bg-blue-900/20 cursor-pointer"
+                            onClick={() => onLogClick(log)}
+                        >
+                            <td style={{ width: '60px' }}>
+                                <span className={`badge badge-xs text-white border-none ${log.status >= 200 && log.status < 400 ? 'badge-success' : 'badge-error'}`}>
+                                    {log.status}
+                                </span>
+                            </td>
+                            <td className="font-bold" style={{ width: '60px' }}>{log.method}</td>
+                            <td className="text-blue-600 truncate" style={{ width: '180px', maxWidth: '180px' }}>
+                                {log.mapped_model && log.model !== log.mapped_model
+                                    ? `${log.model} => ${log.mapped_model}`
+                                    : (log.model || '-')}
+                            </td>
+                            <td className="text-gray-600 dark:text-gray-400 truncate text-[10px]" style={{ width: '140px', maxWidth: '140px' }}>
+                                {log.account_email ? log.account_email.replace(/(.{3}).*(@.*)/, '$1***$2') : '-'}
+                            </td>
+                            <td className="truncate" style={{ maxWidth: '280px' }}>{log.url}</td>
+                            <td className="text-right text-[9px]" style={{ width: '90px' }}>
+                                {log.input_tokens != null && <div>I: {formatCompactNumber(log.input_tokens)}</div>}
+                                {log.output_tokens != null && <div>O: {formatCompactNumber(log.output_tokens)}</div>}
+                            </td>
+                            <td className="text-right" style={{ width: '80px' }}>{log.duration}ms</td>
+                            <td className="text-right text-[10px]" style={{ width: '80px' }}>
+                                {new Date(log.timestamp).toLocaleTimeString()}
+                            </td>
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
+
+            {/* Loading indicator */}
+            {loading && (
+                <div className="flex items-center justify-center p-4 bg-white dark:bg-base-100">
+                    <div className="loading loading-spinner loading-md"></div>
+                    <span className="ml-3 text-sm text-gray-500">{t('common.loading') || 'Loading...'}</span>
+                </div>
+            )}
+
+            {/* Empty state */}
+            {!loading && logs.length === 0 && (
+                <div className="flex items-center justify-center p-8 text-gray-400">
+                    {t('monitor.table.empty') || '暂无请求记录'}
+                </div>
+            )}
+        </div>
+    );
+};
+
+
 export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const { t } = useTranslation();
     const [logs, setLogs] = useState<ProxyRequestLog[]>([]);
@@ -42,22 +133,89 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const [selectedLog, setSelectedLog] = useState<ProxyRequestLog | null>(null);
     const [isLoggingEnabled, setIsLoggingEnabled] = useState(false);
     const [isClearConfirmOpen, setIsClearConfirmOpen] = useState(false);
+    const [copiedRequestId, setCopiedRequestId] = useState<string | null>(null);
 
-    const loadData = async () => {
+    // Pagination state
+    const PAGE_SIZE_OPTIONS = [50, 100, 200, 500];
+    const [pageSize, setPageSize] = useState(100);
+    const [currentPage, setCurrentPage] = useState(1);
+    const [totalCount, setTotalCount] = useState(0);
+    const [loading, setLoading] = useState(false);
+    const [loadingDetail, setLoadingDetail] = useState(false);
+
+    const loadData = async (page = 1, searchFilter = filter) => {
+        if (loading) return;
+        setLoading(true);
+
         try {
-            const config = await invoke<AppConfig>('load_config');
+            // Add timeout control (10 seconds)
+            const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Request timeout')), 10000)
+            );
+
+            const config = await Promise.race([
+                invoke<AppConfig>('load_config'),
+                timeoutPromise
+            ]) as AppConfig;
+
             if (config && config.proxy) {
                 setIsLoggingEnabled(config.proxy.enable_logging);
                 await invoke('set_proxy_monitor_enabled', { enabled: config.proxy.enable_logging });
             }
 
-            const history = await invoke<ProxyRequestLog[]>('get_proxy_logs', { limit: 100 });
-            if (Array.isArray(history)) setLogs(history);
+            // Determine if filtering by errors only
+            const errorsOnly = searchFilter === '__ERROR__';
+            const actualFilter = errorsOnly ? '' : searchFilter;
 
-            const currentStats = await invoke<ProxyStats>('get_proxy_stats');
+            // Get count with filter
+            const count = await Promise.race([
+                invoke<number>('get_proxy_logs_count_filtered', {
+                    filter: actualFilter,
+                    errorsOnly: errorsOnly
+                }),
+                timeoutPromise
+            ]) as number;
+            setTotalCount(count);
+
+            // Use filtered paginated query
+            const offset = (page - 1) * pageSize;
+            const history = await Promise.race([
+                invoke<ProxyRequestLog[]>('get_proxy_logs_filtered', {
+                    filter: actualFilter,
+                    errorsOnly: errorsOnly,
+                    limit: pageSize,
+                    offset: offset
+                }),
+                timeoutPromise
+            ]) as ProxyRequestLog[];
+
+            if (Array.isArray(history)) {
+                setLogs(history);
+            }
+
+            const currentStats = await Promise.race([
+                invoke<ProxyStats>('get_proxy_stats'),
+                timeoutPromise
+            ]) as ProxyStats;
+
             if (currentStats) setStats(currentStats);
-        } catch (e) {
+        } catch (e: any) {
             console.error("Failed to load proxy data", e);
+            if (e.message === 'Request timeout') {
+                // Show timeout error to user
+                console.error('Loading monitor data timeout, please try again later');
+            }
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const totalPages = Math.ceil(totalCount / pageSize);
+
+    const goToPage = (page: number) => {
+        if (page >= 1 && page <= totalPages && page !== currentPage) {
+            setCurrentPage(page);
+            loadData(page, filter);
         }
     };
 
@@ -79,36 +237,74 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     useEffect(() => {
         loadData();
         let unlistenFn: (() => void) | null = null;
+        let updateTimeout: number | null = null;
+        let pendingLogs: ProxyRequestLog[] = [];
+
         const setupListener = async () => {
             unlistenFn = await listen<ProxyRequestLog>('proxy://request', (event) => {
                 const newLog = event.payload;
-                setLogs(prev => [newLog, ...prev].slice(0, 1000));
-                setStats((prev: ProxyStats) => {
-                    const isSuccess = newLog.status >= 200 && newLog.status < 400;
-                    return {
-                        total_requests: prev.total_requests + 1,
-                        success_count: prev.success_count + (isSuccess ? 1 : 0),
-                        error_count: prev.error_count + (isSuccess ? 0 : 1),
-                    };
-                });
+
+                // 移除 body 以减少内存占用
+                const logSummary = {
+                    ...newLog,
+                    request_body: undefined,
+                    response_body: undefined
+                };
+
+                // 添加到待处理队列
+                pendingLogs.push(logSummary);
+
+                // 防抖:每 500ms 批量更新一次
+                if (updateTimeout) clearTimeout(updateTimeout);
+                updateTimeout = setTimeout(() => {
+                    if (pendingLogs.length > 0) {
+                        setLogs(prev => [...pendingLogs, ...prev].slice(0, 100)); // 1000 → 100
+
+                        // 批量更新统计
+                        setStats((prev: ProxyStats) => {
+                            const successCount = pendingLogs.filter(log => log.status >= 200 && log.status < 400).length;
+                            return {
+                                total_requests: prev.total_requests + pendingLogs.length,
+                                success_count: prev.success_count + successCount,
+                                error_count: prev.error_count + (pendingLogs.length - successCount),
+                            };
+                        });
+
+                        pendingLogs = [];
+                    }
+                }, 500);
             });
         };
         setupListener();
-        return () => { if (unlistenFn) unlistenFn(); };
+        return () => {
+            if (unlistenFn) unlistenFn();
+            if (updateTimeout) clearTimeout(updateTimeout);
+        };
     }, []);
 
-    const filteredLogs = logs
-        .filter(log =>
-            log.url.toLowerCase().includes(filter.toLowerCase()) ||
-            log.method.toLowerCase().includes(filter.toLowerCase()) ||
-            (log.model && log.model.toLowerCase().includes(filter.toLowerCase())) ||
-            log.status.toString().includes(filter)
-        )
-        .sort((a, b) => b.timestamp - a.timestamp);
+    useEffect(() => {
+        setCopiedRequestId(null);
+    }, [selectedLog?.id]);
+
+    // Reload when pageSize changes
+    useEffect(() => {
+        setCurrentPage(1);
+        loadData(1, filter);
+    }, [pageSize]);
+
+    // Reload when filter changes (search based on all logs)
+    useEffect(() => {
+        setCurrentPage(1);
+        loadData(1, filter);
+    }, [filter]);
+
+    // Logs are already filtered and sorted by backend
+    // Just use logs directly as filteredLogs for compatibility
+    const filteredLogs = logs;
 
     const quickFilters = [
         { label: t('monitor.filters.all'), value: '' },
-        { label: t('monitor.filters.error'), value: '40' },
+        { label: t('monitor.filters.error'), value: '__ERROR__' },
         { label: t('monitor.filters.chat'), value: 'completions' },
         { label: t('monitor.filters.gemini'), value: 'gemini' },
         { label: t('monitor.filters.claude'), value: 'claude' },
@@ -137,6 +333,28 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             return <pre className="text-[10px] font-mono whitespace-pre-wrap text-gray-700 dark:text-gray-300">{JSON.stringify(obj, null, 2)}</pre>;
         } catch (e) {
             return <pre className="text-[10px] font-mono whitespace-pre-wrap text-gray-700 dark:text-gray-300">{body}</pre>;
+        }
+    };
+
+    const getCopyPayload = (body: string) => {
+        try {
+            const obj = JSON.parse(body);
+            return JSON.stringify(obj, null, 2);
+        } catch (e) {
+            return body;
+        }
+    };
+
+    const handleCopyRequest = async () => {
+        if (!selectedLog?.request_body) return;
+        try {
+            await navigator.clipboard.writeText(getCopyPayload(selectedLog.request_body));
+            setCopiedRequestId(selectedLog.id);
+            setTimeout(() => {
+                setCopiedRequestId((current) => (current === selectedLog.id ? null : current));
+            }, 2000);
+        } catch (e) {
+            console.error('Failed to copy request payload', e);
         }
     };
 
@@ -188,44 +406,62 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                 </div>
             </div>
 
-            <div className="flex-1 overflow-auto bg-white dark:bg-base-100">
-                <table className="table table-xs w-full">
-                    <thead className="bg-gray-50 dark:bg-base-200 text-gray-500 sticky top-0">
-                        <tr>
-                            <th>{t('monitor.table.status')}</th>
-                            <th>{t('monitor.table.method')}</th>
-                            <th>{t('monitor.table.model')}</th>
-                            <th>{t('monitor.table.account')}</th>
-                            <th>{t('monitor.table.path')}</th>
-                            <th className="text-right">{t('monitor.table.usage')}</th>
-                            <th className="text-right">{t('monitor.table.duration')}</th>
-                            <th className="text-right">{t('monitor.table.time')}</th>
-                        </tr>
-                    </thead>
-                    <tbody className="font-mono text-gray-700 dark:text-gray-300">
-                        {filteredLogs.map(log => (
-                            <tr key={log.id} className="hover:bg-blue-50 dark:hover:bg-blue-900/20 cursor-pointer" onClick={() => setSelectedLog(log)}>
-                                <td><span className={`badge badge-xs text-white border-none ${log.status >= 200 && log.status < 400 ? 'badge-success' : 'badge-error'}`}>{log.status}</span></td>
-                                <td className="font-bold">{log.method}</td>
-                                <td className="text-blue-600 truncate max-w-[180px]">
-                                    {log.mapped_model && log.model !== log.mapped_model
-                                        ? `${log.model} => ${log.mapped_model}`
-                                        : (log.model || '-')}
-                                </td>
-                                <td className="text-gray-600 dark:text-gray-400 truncate max-w-[120px] text-[10px]">
-                                    {log.account_email ? log.account_email.replace(/(.{3}).*(@.*)/, '$1***$2') : '-'}
-                                </td>
-                                <td className="truncate max-w-[240px]">{log.url}</td>
-                                <td className="text-right text-[9px]">
-                                    {log.input_tokens != null && <div>I: {formatCompactNumber(log.input_tokens)}</div>}
-                                    {log.output_tokens != null && <div>O: {formatCompactNumber(log.output_tokens)}</div>}
-                                </td>
-                                <td className="text-right">{log.duration}ms</td>
-                                <td className="text-right text-[10px]">{new Date(log.timestamp).toLocaleTimeString()}</td>
-                            </tr>
+            <LogTable
+                logs={filteredLogs}
+                loading={loading}
+                onLogClick={async (log: ProxyRequestLog) => {
+                    setLoadingDetail(true);
+                    try {
+                        const detail = await invoke<ProxyRequestLog>('get_proxy_log_detail', { logId: log.id });
+                        setSelectedLog(detail);
+                    } catch (e) {
+                        console.error('Failed to load log detail', e);
+                        setSelectedLog(log);
+                    } finally {
+                        setLoadingDetail(false);
+                    }
+                }}
+                t={t}
+            />
+
+            {/* Pagination Controls */}
+            <div className="flex items-center justify-between px-4 py-3 bg-gray-50 dark:bg-base-200 border-t border-gray-200 dark:border-base-300 text-xs">
+                <div className="flex items-center gap-2 whitespace-nowrap">
+                    <span className="text-gray-500">Per page</span>
+                    <select
+                        value={pageSize}
+                        onChange={(e) => setPageSize(Number(e.target.value))}
+                        className="select select-xs select-bordered w-16"
+                    >
+                        {PAGE_SIZE_OPTIONS.map(size => (
+                            <option key={size} value={size}>{size}</option>
                         ))}
-                    </tbody>
-                </table>
+                    </select>
+                </div>
+
+                <div className="flex items-center gap-3">
+                    <button
+                        onClick={() => goToPage(currentPage - 1)}
+                        disabled={currentPage <= 1 || loading}
+                        className="btn btn-xs btn-ghost"
+                    >
+                        <ChevronLeft size={14} />
+                    </button>
+                    <span className="text-gray-600 dark:text-gray-400 min-w-[80px] text-center">
+                        {currentPage} / {totalPages || 1}
+                    </span>
+                    <button
+                        onClick={() => goToPage(currentPage + 1)}
+                        disabled={currentPage >= totalPages || loading}
+                        className="btn btn-xs btn-ghost"
+                    >
+                        <ChevronRight size={14} />
+                    </button>
+                </div>
+
+                <div className="text-gray-500">
+                    Total {totalCount} records
+                </div>
             </div>
 
             {selectedLog && (
@@ -234,6 +470,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                         {/* Modal Header */}
                         <div className="px-4 py-3 border-b border-gray-100 dark:border-slate-700 flex items-center justify-between bg-gray-50 dark:bg-slate-900">
                             <div className="flex items-center gap-3">
+                                {loadingDetail && <div className="loading loading-spinner loading-sm"></div>}
                                 <span className={`badge badge-sm text-white border-none ${selectedLog.status >= 200 && selectedLog.status < 400 ? 'badge-success' : 'badge-error'}`}>{selectedLog.status}</span>
                                 <span className="font-mono font-bold text-gray-900 dark:text-white text-sm">{selectedLog.method}</span>
                                 <span className="text-xs text-gray-500 dark:text-slate-400 font-mono truncate max-w-md hidden sm:inline">{selectedLog.url}</span>
@@ -287,11 +524,62 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                             {/* Payloads */}
                             <div className="space-y-4">
                                 <div>
-                                    <h3 className="text-xs font-bold uppercase text-gray-400 mb-2 flex items-center gap-2">{t('monitor.details.request_payload')}</h3>
+                                    <div className="flex items-center justify-between mb-2">
+                                        <h3 className="text-xs font-bold uppercase text-gray-400 flex items-center gap-2">{t('monitor.details.request_payload')}</h3>
+                                        <button
+                                            type="button"
+                                            className="btn btn-ghost btn-xs gap-1"
+                                            onClick={handleCopyRequest}
+                                            disabled={!selectedLog.request_body}
+                                            title={copiedRequestId === selectedLog.id ? t('proxy.config.btn_copied') : t('proxy.config.btn_copy')}
+                                            aria-label={t('proxy.config.btn_copy')}
+                                        >
+                                            {copiedRequestId === selectedLog.id ? (
+                                                <CheckCircle size={12} className="text-green-500" />
+                                            ) : (
+                                                <Copy size={12} />
+                                            )}
+                                            <span className="text-[10px]">
+                                                {copiedRequestId === selectedLog.id ? t('proxy.config.btn_copied') : t('proxy.config.btn_copy')}
+                                            </span>
+                                        </button>
+                                    </div>
                                     <div className="bg-gray-50 dark:bg-base-300 rounded-lg p-3 border border-gray-100 dark:border-base-300 overflow-hidden">{formatBody(selectedLog.request_body)}</div>
                                 </div>
                                 <div>
-                                    <h3 className="text-xs font-bold uppercase text-gray-400 mb-2 flex items-center gap-2">{t('monitor.details.response_payload')}</h3>
+                                    <div className="flex items-center justify-between mb-2">
+                                        <h3 className="text-xs font-bold uppercase text-gray-400 flex items-center gap-2">{t('monitor.details.response_payload')}</h3>
+                                        <button
+                                            type="button"
+                                            className="btn btn-ghost btn-xs gap-1"
+                                            onClick={async () => {
+                                                if (!selectedLog.response_body) return;
+                                                try {
+                                                    await navigator.clipboard.writeText(getCopyPayload(selectedLog.response_body));
+                                                    setCopiedRequestId(selectedLog.id ? `${selectedLog.id}-response` : null);
+                                                    setTimeout(() => {
+                                                        setCopiedRequestId((current) =>
+                                                            current === `${selectedLog.id}-response` ? null : current
+                                                        );
+                                                    }, 2000);
+                                                } catch (e) {
+                                                    console.error('Failed to copy response payload', e);
+                                                }
+                                            }}
+                                            disabled={!selectedLog.response_body}
+                                            title={copiedRequestId === `${selectedLog.id}-response` ? t('proxy.config.btn_copied') : t('proxy.config.btn_copy')}
+                                            aria-label={t('proxy.config.btn_copy')}
+                                        >
+                                            {copiedRequestId === `${selectedLog.id}-response` ? (
+                                                <CheckCircle size={12} className="text-green-500" />
+                                            ) : (
+                                                <Copy size={12} />
+                                            )}
+                                            <span className="text-[10px]">
+                                                {copiedRequestId === `${selectedLog.id}-response` ? t('proxy.config.btn_copied') : t('proxy.config.btn_copy')}
+                                            </span>
+                                        </button>
+                                    </div>
                                     <div className="bg-gray-50 dark:bg-base-300 rounded-lg p-3 border border-gray-100 dark:border-base-300 overflow-hidden">{formatBody(selectedLog.response_body)}</div>
                                 </div>
                             </div>

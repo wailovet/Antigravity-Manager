@@ -130,6 +130,11 @@ pub struct ExperimentalConfig {
     /// 启用跨模型兼容性检查 (Cross-Model Checks)
     #[serde(default = "default_true")]
     pub enable_cross_model_checks: bool,
+
+    /// 启用上下文用量缩放 (Context Usage Scaling)
+    /// 用于解决客户端因 Gemini 上下文过大而错误触发压缩的问题
+    #[serde(default = "default_true")]
+    pub enable_usage_scaling: bool,
 }
 
 impl Default for ExperimentalConfig {
@@ -138,6 +143,7 @@ impl Default for ExperimentalConfig {
             enable_signature_cache: true,
             enable_tool_loop_recovery: true,
             enable_cross_model_checks: true,
+            enable_usage_scaling: true,
         }
     }
 }
@@ -173,14 +179,6 @@ pub struct ProxyConfig {
 
     /// 是否自动启动
     pub auto_start: bool,
-
-    /// Anthropic 模型映射表 (key: Claude模型名, value: Gemini模型名)
-    #[serde(default)]
-    pub anthropic_mapping: std::collections::HashMap<String, String>,
-
-    /// OpenAI 模型映射表 (key: OpenAI模型组, value: Gemini模型名)
-    #[serde(default)]
-    pub openai_mapping: std::collections::HashMap<String, String>,
 
     /// 自定义精确模型映射表 (key: 原始模型名, value: 目标模型名)
     #[serde(default)]
@@ -229,8 +227,6 @@ impl Default for ProxyConfig {
             port: 8045,
             api_key: format!("sk-{}", uuid::Uuid::new_v4().simple()),
             auto_start: false,
-            anthropic_mapping: std::collections::HashMap::new(),
-            openai_mapping: std::collections::HashMap::new(),
             custom_mapping: std::collections::HashMap::new(),
             request_timeout: default_request_timeout(),
             enable_logging: false, // 默认关闭，节省性能

@@ -7,12 +7,14 @@ pub mod response;
 pub mod streaming;
 pub mod utils;
 pub mod thinking_utils;
+pub mod collector;
 
 pub use models::*;
 pub use request::transform_claude_request_in;
 pub use response::transform_response;
 pub use streaming::{PartProcessor, StreamingState};
 pub use thinking_utils::close_tool_loop_for_thinking;
+pub use collector::collect_stream_to_json;
 
 use bytes::Bytes;
 use futures::Stream;
@@ -23,6 +25,9 @@ pub fn create_claude_sse_stream(
     mut gemini_stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     trace_id: String,
     email: String,
+    session_id: Option<String>, // [NEW v3.3.17] Session ID for signature caching
+    scaling_enabled: bool, // [NEW] Flag for context usage scaling
+    context_limit: u32,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> {
     use async_stream::stream;
     use bytes::BytesMut;
@@ -30,31 +35,49 @@ pub fn create_claude_sse_stream(
 
     Box::pin(stream! {
         let mut state = StreamingState::new();
+        state.session_id = session_id; // Set session ID for signature caching
+        state.scaling_enabled = scaling_enabled; // Set scaling enabled flag
+        state.context_limit = context_limit;
         let mut buffer = BytesMut::new();
 
-        while let Some(chunk_result) = gemini_stream.next().await {
-            match chunk_result {
-                Ok(chunk) => {
-                    buffer.extend_from_slice(&chunk);
+        loop {
+            // [NEW] 15秒心跳保活: 如果长时间无数据，发送 ping 包
+            let next_chunk = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                gemini_stream.next()
+            ).await;
 
-                    // Process complete lines
-                    while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-                        let line_raw = buffer.split_to(pos + 1);
-                        if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                            let line = line_str.trim();
-                            if line.is_empty() { continue; }
+            match next_chunk {
+                Ok(Some(chunk_result)) => {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            buffer.extend_from_slice(&chunk);
 
-                            if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
-                                for sse_chunk in sse_chunks {
-                                    yield Ok(sse_chunk);
+                            // Process complete lines
+                            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                                let line_raw = buffer.split_to(pos + 1);
+                                if let Ok(line_str) = std::str::from_utf8(&line_raw) {
+                                    let line = line_str.trim();
+                                    if line.is_empty() { continue; }
+
+                                    if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
+                                        for sse_chunk in sse_chunks {
+                                            yield Ok(sse_chunk);
+                                        }
+                                    }
                                 }
                             }
                         }
+                        Err(e) => {
+                            yield Err(format!("Stream error: {}", e));
+                            break;
+                        }
                     }
                 }
-                Err(e) => {
-                    yield Err(format!("Stream error: {}", e));
-                    break;
+                Ok(None) => break, // Stream 正常结束
+                Err(_) => {
+                    // 超时，发送心跳包 (SSE Comment 格式)
+                    yield Ok(Bytes::from(": ping\n\n"));
                 }
             }
         }
@@ -210,6 +233,7 @@ pub fn emit_force_stop(state: &mut StreamingState) -> Vec<Bytes> {
 }
 
 /// Process grounding metadata from Gemini's googleSearch and emit as Claude web_search blocks
+#[allow(dead_code)] // Temporarily disabled for Cherry Studio compatibility, kept for future use
 fn process_grounding_metadata(
     metadata: &serde_json::Value,
     state: &mut StreamingState,
